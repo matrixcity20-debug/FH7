@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: filesplit
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node dist/server/index.js
+    healthCheckPath: /api/healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: PORT
+        value: "5000"
+    disk:
+      name: uploads
+      mountPath: /uploads
+      sizeGB: 1

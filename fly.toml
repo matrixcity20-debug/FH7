@@ -1,0 +1,30 @@
+app = "filesplit"
+primary_region = "fra"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+  PORT = "5000"
+
+[[services]]
+  internal_port = 5000
+  protocol = "tcp"
+
+  [[services.ports]]
+    force_https = true
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.http_checks]]
+    interval = 30000
+    timeout = 5000
+    path = "/api/healthz"
+
+[mounts]
+  source = "filesplit_data"
+  destination = "/uploads"

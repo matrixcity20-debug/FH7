@@ -1,0 +1,89 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --font-sans: var(--app-font-sans);
+  --font-mono: var(--app-font-mono);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --background: 210 11% 6%;
+  --foreground: 180 10% 90%;
+  --border: 200 10% 14%;
+  --input: 200 10% 14%;
+  --ring: 175 84% 45%;
+
+  --card: 210 11% 9%;
+  --card-foreground: 180 10% 90%;
+
+  --popover: 210 11% 8%;
+  --popover-foreground: 180 10% 90%;
+
+  --primary: 175 84% 45%;
+  --primary-foreground: 210 11% 6%;
+
+  --secondary: 210 11% 14%;
+  --secondary-foreground: 180 10% 80%;
+
+  --muted: 210 11% 12%;
+  --muted-foreground: 200 8% 50%;
+
+  --accent: 210 11% 14%;
+  --accent-foreground: 180 10% 85%;
+
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 98%;
+
+  --app-font-sans: 'Inter', system-ui, sans-serif;
+  --app-font-mono: 'JetBrains Mono', 'Fira Code', Menlo, monospace;
+  --radius: 0.5rem;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+}
+
+.gradient-text {
+  background: linear-gradient(135deg, hsl(175 84% 55%), hsl(190 80% 65%));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.glow-cyan-sm {
+  box-shadow: 0 0 12px hsl(175 84% 45% / 0.3);
+}
+
+.dropzone-active {
+  box-shadow: 0 0 0 1px hsl(175 84% 45% / 0.5), 0 0 24px hsl(175 84% 45% / 0.15);
+}
