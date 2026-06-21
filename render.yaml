@@ -13,6 +13,8 @@ services:
         generateValue: true
       - key: PORT
         value: "5000"
+      - key: ALLOWED_ORIGINS
+        value: "https://filesplithosting.onrender.com"
     disk:
       name: uploads
       mountPath: /uploads

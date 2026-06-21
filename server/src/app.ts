@@ -96,7 +96,7 @@ app.use(
 app.use("/api", router);
 
 if (process.env["NODE_ENV"] === "production") {
-  const publicDir = path.resolve(__dirname, "../../public");
+  const publicDir = path.resolve(__dirname, "../public");
   app.use(express.static(publicDir));
   app.get("/*splat", (_req, res) => {
     res.sendFile(path.join(publicDir, "index.html"));
