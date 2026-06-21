@@ -21,6 +21,7 @@
     "multer": "^2.0.0",
     "pino": "^9.0.0",
     "pino-http": "^10.0.0",
+    "pino-pretty": "^11.3.0",
     "session-file-store": "^1.5.0",
     "uuid": "^11.0.0",
     "ws": "^8.18.0"
@@ -51,7 +52,6 @@
     "esbuild": "^0.25.0",
     "framer-motion": "^12.9.4",
     "lucide-react": "^0.487.0",
-    "pino-pretty": "^11.3.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "tailwind-merge": "^2.6.0",

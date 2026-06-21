@@ -5,12 +5,10 @@ import FileStore from "session-file-store";
 import helmet from "helmet";
 import pinoHttp from "pino-http";
 import path from "path";
-import { fileURLToPath } from "url";
 import router from "./routes/index.js";
 import { logger } from "./lib/logger.js";
 import { uploadsDir, ensureUploadsDir } from "./lib/fileStore.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SessionFileStore = FileStore(session);
 
 declare module "express-session" {
@@ -96,7 +94,7 @@ app.use(
 app.use("/api", router);
 
 if (process.env["NODE_ENV"] === "production") {
-  const publicDir = path.resolve(__dirname, "../public");
+  const publicDir = path.resolve(process.cwd(), "dist/public");
   app.use(express.static(publicDir));
   app.get("/*splat", (_req, res) => {
     res.sendFile(path.join(publicDir, "index.html"));
