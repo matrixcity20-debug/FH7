@@ -246,6 +246,7 @@ export default function FileDetailPage() {
   const [loading, setLoading] = useState(true);
   const [copiedSnippet, setCopiedSnippet] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [copiedDirectLink, setCopiedDirectLink] = useState(false);
 
   useEffect(() => {
     if (!fileId) return;
@@ -269,10 +270,11 @@ export default function FileDetailPage() {
     else toast({ variant: "destructive", title: "Silme başarısız" });
   };
 
-  const copy = async (text: string, type: "snippet" | "link") => {
+  const copy = async (text: string, type: "snippet" | "link" | "directLink") => {
     try {
       await navigator.clipboard.writeText(text);
       if (type === "snippet") { setCopiedSnippet(true); setTimeout(() => setCopiedSnippet(false), 2000); }
+      else if (type === "directLink") { setCopiedDirectLink(true); setTimeout(() => setCopiedDirectLink(false), 2000); }
       else { setCopiedLink(true); setTimeout(() => setCopiedLink(false), 2000); }
     } catch { toast({ variant: "destructive", title: "Kopyalanamadı" }); }
   };
@@ -304,6 +306,7 @@ export default function FileDetailPage() {
 
   const isSeedOnly = !!file.seedOnly;
   const downloadUrl = `/api/files/${fileId}/download`;
+  const directDownloadUrl = `${window.location.origin}${downloadUrl}`;
   const shareUrl = `${window.location.origin}/files/${fileId}`;
   const isExpired = file.expiresAt ? new Date(file.expiresAt) < new Date() : false;
 
@@ -350,8 +353,14 @@ export default function FileDetailPage() {
         <div className="flex items-center gap-2 shrink-0">
           <Button variant="outline" size="sm" className="gap-2 text-xs font-mono" onClick={() => copy(shareUrl, "link")}>
             {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Link2 className="w-3.5 h-3.5" />}
-            {copiedLink ? "Kopyalandı!" : "Linki Kopyala"}
+            {copiedLink ? "Kopyalandı!" : "Sayfa Linki"}
           </Button>
+          {!isSeedOnly && (
+            <Button variant="outline" size="sm" className="gap-2 text-xs font-mono" onClick={() => copy(directDownloadUrl, "directLink")}>
+              {copiedDirectLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+              {copiedDirectLink ? "Kopyalandı!" : "Direkt Link"}
+            </Button>
+          )}
           {!isSeedOnly && (
             <a href={downloadUrl} download={file.name}>
               <Button size="sm" variant="secondary" className="gap-2 text-xs font-mono">
@@ -465,6 +474,7 @@ export default function FileDetailPage() {
               <CardTitle className="font-mono text-sm flex items-center gap-2">
                 <Link2 className="w-3.5 h-3.5 text-primary" /> Paylaşım Linki
               </CardTitle>
+              <CardDescription className="text-xs">Bu sayfaya gelen herkes dosyayı görür ve indirebilir. Direkt link gömmez, önce önizleme sayfası açılır.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
               <div className="p-3 rounded-lg bg-muted/20 border border-border/40">
@@ -472,17 +482,35 @@ export default function FileDetailPage() {
               </div>
               <Button className="w-full gap-2 text-xs font-mono" onClick={() => copy(shareUrl, "link")}>
                 {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                {copiedLink ? "Kopyalandı!" : "Linki Kopyala"}
+                {copiedLink ? "Kopyalandı!" : "Sayfa Linkini Kopyala"}
               </Button>
-              {!isSeedOnly && (
+            </CardContent>
+          </Card>
+
+          {!isSeedOnly && (
+            <Card className="border-border/60 bg-card/60">
+              <CardHeader className="pb-3">
+                <CardTitle className="font-mono text-sm flex items-center gap-2">
+                  <Download className="w-3.5 h-3.5 text-primary" /> Direkt İndirme Linki
+                </CardTitle>
+                <CardDescription className="text-xs">Tıklandığı anda dosya indirmeye başlar. Başka bir siteye buton/&lt;a&gt; olarak gömmek için uygundur.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="p-3 rounded-lg bg-muted/20 border border-border/40">
+                  <code className="text-xs font-mono text-muted-foreground break-all leading-relaxed">{directDownloadUrl}</code>
+                </div>
+                <Button className="w-full gap-2 text-xs font-mono" onClick={() => copy(directDownloadUrl, "directLink")}>
+                  {copiedDirectLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedDirectLink ? "Kopyalandı!" : "Direkt Linki Kopyala"}
+                </Button>
                 <a href={downloadUrl} download={file.name} className="block">
                   <Button variant="outline" className="w-full gap-2 text-xs font-mono">
                     <Download className="w-3.5 h-3.5" /> Dosyayı İndir
                   </Button>
                 </a>
-              )}
-            </CardContent>
-          </Card>
+              </CardContent>
+            </Card>
+          )}
         </div>
       </div>
     </div>

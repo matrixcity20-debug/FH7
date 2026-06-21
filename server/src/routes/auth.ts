@@ -42,18 +42,28 @@ router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
 
   const trimmedUsername = username.trim();
 
-  if (usernameExists(trimmedUsername)) {
+  if (await usernameExists(trimmedUsername)) {
     res.status(409).json({ error: "Bu kullanıcı adı zaten kullanılıyor" });
     return;
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
-  const user = createUser(trimmedUsername, passwordHash);
 
-  req.session.userId = user.id;
+  try {
+    const user = await createUser(trimmedUsername, passwordHash);
 
-  req.log.info({ userId: user.id, username: user.username }, "User registered");
-  res.status(201).json({ id: user.id, username: user.username });
+    req.session.userId = user.id;
+
+    req.log.info({ userId: user.id, username: user.username }, "User registered");
+    res.status(201).json({ id: user.id, username: user.username });
+  } catch (err) {
+    if (err instanceof Error && err.message === "USERNAME_TAKEN") {
+      res.status(409).json({ error: "Bu kullanıcı adı zaten kullanılıyor" });
+      return;
+    }
+    req.log.error({ err }, "Register failed");
+    res.status(500).json({ error: "Kayıt başarısız, lütfen tekrar deneyin" });
+  }
 });
 
 router.post("/auth/login", authLimiter, async (req, res): Promise<void> => {
@@ -64,7 +74,7 @@ router.post("/auth/login", authLimiter, async (req, res): Promise<void> => {
     return;
   }
 
-  const user = findUserByUsername(username.trim());
+  const user = await findUserByUsername(username.trim());
   if (!user) {
     res.status(401).json({ error: "Kullanıcı adı veya şifre hatalı" });
     return;
@@ -88,13 +98,13 @@ router.post("/auth/logout", (req, res): void => {
   });
 });
 
-router.get("/auth/me", (req, res): void => {
+router.get("/auth/me", async (req, res): Promise<void> => {
   const userId = req.session.userId;
   if (!userId) {
     res.status(401).json({ error: "Not authenticated" });
     return;
   }
-  const user = findUserById(userId);
+  const user = await findUserById(userId);
   if (!user) {
     req.session.destroy(() => {});
     res.status(401).json({ error: "Not authenticated" });

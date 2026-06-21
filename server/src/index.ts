@@ -1,3 +1,4 @@
+import "./lib/env.js";
 import { createServer } from "http";
 import app from "./app.js";
 import { logger } from "./lib/logger.js";
