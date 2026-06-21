@@ -563,11 +563,6 @@ router.get("/files/:fileId/download", async (req, res): Promise<void> => {
     res.status(404).json({ error: "Dosya bulunamadı" });
     return;
   }
-  if (meta.userId !== req.session.userId) {
-    res.status(403).json({ error: "Bu dosyaya erişim izniniz yok" });
-    return;
-  }
-
   if (isFileExpired(meta)) {
     deleteFile(meta.id);
     res.status(410).json({ error: "Dosyanın süresi doldu" });

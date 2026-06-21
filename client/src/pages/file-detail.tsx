@@ -304,7 +304,7 @@ export default function FileDetailPage() {
 
   const isSeedOnly = !!file.seedOnly;
   const downloadUrl = `/api/files/${fileId}/download`;
-  const shareUrl = `${window.location.origin}/filesplit/files/${fileId}`;
+  const shareUrl = `${window.location.origin}/files/${fileId}`;
   const isExpired = file.expiresAt ? new Date(file.expiresAt) < new Date() : false;
 
   return (
