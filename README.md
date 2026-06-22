@@ -37,6 +37,15 @@ NODE_ENV=development
 
 `.env` dosyası `npm run dev` ve `npm start` ile otomatik yüklenir (Node.js'in yerleşik `process.loadEnvFile()` özelliği — ek paket gerekmez).
 
+İsteğe bağlı değişkenler (hepsinin makul varsayılanları var):
+
+```
+ALLOWED_ORIGINS=https://siteniz.com   # production'da ZORUNLU, yoksa uygulama başlamaz
+MAX_FILE_SIZE_MB=500                  # dosya başına maksimum boyut (varsayılan 500, üst sınır 2000)
+MAX_USER_STORAGE_MB=5000              # kullanıcı başına toplam depolama kotası (varsayılan 5 GB)
+CHUNK_SIZE_MB=1                       # her dosya parçasının boyutu (varsayılan 1, üst sınır 100)
+```
+
 ## Firebase Realtime Database Kurulumu (kullanıcı hesapları)
 
 Kullanıcı kayıtlarını Firebase Realtime Database'e kaydetmek **isteğe bağlıdır**.
@@ -81,6 +90,20 @@ yerel dosyaya (`uploads/_users.json`) kaydedilir ve uygulama sorunsuz çalışı
    sekmesine `database.rules.json` içeriğini yapıştırarak uygulayabilirsiniz.)
 
 6. Servis hesabı JSON dosyasını **asla** repoya commit etmeyin; `.env` dosyası `.gitignore`'da zaten hariç tutulmuştur. Hosting platformunuzda (Fly/Railway/Render) bu dört değişkeni "secret/environment variable" olarak ekleyin.
+
+**Yerelden Firebase'e geçiş yapıyorsanız:** Uygulamayı önce Firebase olmadan
+çalıştırıp gerçek kullanıcılar biriktirdiyseniz, FIREBASE_* değişkenlerini
+eklemeden önce şu komutu çalıştırın — aksi halde yerel kullanıcılarınız
+Firebase'in kullanıcı-adı index'inde görünmez ve biri aynı kullanıcı adıyla
+**farklı** bir hesap kaydedebilir:
+
+```bash
+npm run migrate:users
+```
+
+Script idempotenttir (güvenle tekrar çalıştırılabilir) ve bir kullanıcı adı
+hem yerelde hem Firebase'de **farklı** hesaplar olarak çakışıyorsa bunu açıkça
+raporlar; bu durumda otomatik üzerine yazma yapmaz, manuel karar vermeniz gerekir.
 
 ## Geliştirme
 
