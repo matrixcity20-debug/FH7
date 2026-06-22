@@ -23,12 +23,28 @@ app.set("trust proxy", 1);
 
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    // BUL-06: enable CSP with permissive policy (supports React, WebRTC, WebSocket)
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        mediaSrc: ["'self'", "blob:"],
+        connectSrc: ["'self'", "wss:", "ws:", "https:"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'self'"],
+      },
+    },
     crossOriginEmbedderPolicy: false,
   }),
 );
 
-const allowedOrigins = process.env["ALLOWED_ORIGINS"]
+// BUL-05: fail-fast in production if ALLOWED_ORIGINS is not configured
+if (process.env["NODE_ENV"] === "production" && !process.env["ALLOWED_ORIGINS"]) {
+  throw new Error("ALLOWED_ORIGINS environment variable is required in production");
+}
+const allowedOrigins: string[] | true = process.env["ALLOWED_ORIGINS"]
   ? process.env["ALLOWED_ORIGINS"].split(",").map((o) => o.trim())
   : true;
 

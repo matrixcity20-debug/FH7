@@ -2,6 +2,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage, Server } from "http";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "./logger.js";
+import { isValidFileId, readMeta } from "./fileStore.js";
 
 interface Client {
   id: string;
@@ -41,6 +42,11 @@ export function attachSignalingServer(httpServer: Server) {
 
       if (type === "seed") {
         const fileId = msg["fileId"] as string;
+        // BUL-02: validate fileId format and file existence before registering seeder
+        if (!fileId || !isValidFileId(fileId) || !readMeta(fileId)) {
+          send(ws, { type: "error", message: "Geçersiz veya bulunamayan dosya" });
+          return;
+        }
         client.role = "seeder";
         client.fileId = fileId;
         seeders.set(fileId, clientId);
@@ -67,15 +73,18 @@ export function attachSignalingServer(httpServer: Server) {
       } else if (type === "offer") {
         const to = msg["to"] as string;
         const target = clients.get(to);
-        if (target) send(target.ws, { type: "offer", from: clientId, sdp: msg["sdp"] });
+        // BUL-02: only relay between clients in the same fileId session
+        if (target && client.fileId && target.fileId === client.fileId)
+          send(target.ws, { type: "offer", from: clientId, sdp: msg["sdp"] });
       } else if (type === "answer") {
         const to = msg["to"] as string;
         const target = clients.get(to);
-        if (target) send(target.ws, { type: "answer", from: clientId, sdp: msg["sdp"] });
+        if (target && client.fileId && target.fileId === client.fileId)
+          send(target.ws, { type: "answer", from: clientId, sdp: msg["sdp"] });
       } else if (type === "ice") {
         const to = msg["to"] as string;
         const target = clients.get(to);
-        if (target)
+        if (target && client.fileId && target.fileId === client.fileId)
           send(target.ws, { type: "ice", from: clientId, candidate: msg["candidate"] });
       } else if (type === "seeder-status") {
         const fileId = (msg["fileId"] as string) ?? client.fileId;

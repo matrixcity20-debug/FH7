@@ -260,15 +260,29 @@ export function nextVersion(groupId: string): number {
 
 export const UPLOAD_PART_SIZE = 5 * 1024 * 1024;
 
+const UPLOAD_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isValidUploadId(uploadId: string): boolean {
+  return UPLOAD_ID_PATTERN.test(uploadId);
+}
+
 export function getUploadTempDir(uploadId: string): string {
+  if (!isValidUploadId(uploadId)) {
+    throw new Error(`Invalid uploadId: "${uploadId}"`);
+  }
   return path.join(uploadsDir, `upload_${uploadId}`);
 }
 
 export function getPartPath(uploadId: string, partIndex: number): string {
+  if (!Number.isInteger(partIndex) || partIndex < 0) {
+    throw new Error(`Invalid partIndex: ${partIndex}`);
+  }
   return path.join(getUploadTempDir(uploadId), `part_${partIndex}`);
 }
 
 export function cleanupUpload(uploadId: string): void {
+  if (!isValidUploadId(uploadId)) return;
   try { fs.rmSync(getUploadTempDir(uploadId), { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
@@ -292,7 +306,7 @@ export function assembleAndSplit(uploadId: string, fileId: string, totalParts: n
 export function generateSnippet(meta: FileMeta, baseUrl: string): string {
   return `(function() {
   var fileId = "${meta.id}";
-  var fileName = ${JSON.stringify(meta.name)};
+  var fileName = ${JSON.stringify(meta.name.replace(/<\/script>/gi, "<\/scr\"+"ipt>"))};
   var mimeType = ${JSON.stringify(meta.mimeType)};
   var chunkCount = ${meta.chunkCount};
   var baseUrl = ${JSON.stringify(baseUrl)};

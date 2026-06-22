@@ -22,6 +22,7 @@ import {
   getUploadTempDir,
   getPartPath,
   cleanupUpload,
+  isValidUploadId,
   assembleAndSplit,
   listVersions,
   nextVersion,
@@ -70,6 +71,12 @@ const MAX_CHUNK_COUNT = 10_000;
 const MAX_SEED_SIZE = 50 * 1024 * 1024 * 1024;
 
 function getBaseUrl(req: Request): string {
+  // BUL-07: prefer ALLOWED_ORIGINS env to avoid Host header injection
+  const allowedOrigins = process.env["ALLOWED_ORIGINS"];
+  if (allowedOrigins) {
+    const first = allowedOrigins.split(",")[0]?.trim();
+    if (first) return first;
+  }
   const host = req.get("host") ?? "localhost";
   const forwardedProto = req.get("x-forwarded-proto");
   const protocol = forwardedProto ?? req.protocol ?? "http";
@@ -261,7 +268,7 @@ const partUpload = multer({
   storage: multer.diskStorage({
     destination: (req, _file, cb) => {
       const uploadId = req.body?.uploadId as string | undefined;
-      if (!uploadId) { cb(new Error("uploadId eksik"), ""); return; }
+      if (!uploadId || !isValidUploadId(uploadId)) { cb(new Error("Geçersiz uploadId"), ""); return; }
       const dir = getUploadTempDir(uploadId);
       if (!fs.existsSync(dir)) { cb(new Error("Bilinmeyen uploadId"), ""); return; }
       cb(null, dir);
@@ -282,7 +289,7 @@ router.post(
     const { uploadId } = req.body as { uploadId: string };
     const partIndex = parseInt(req.body?.partIndex ?? "", 10);
 
-    if (!uploadId || isNaN(partIndex) || partIndex < 0) {
+    if (!uploadId || !isValidUploadId(uploadId) || isNaN(partIndex) || partIndex < 0) {
       res.status(400).json({ error: "Geçersiz uploadId veya partIndex" });
       return;
     }
@@ -309,7 +316,7 @@ router.post("/files/upload-finalize", requireAuth, async (req, res): Promise<voi
     folderId?: string;
   };
 
-  if (!uploadId || !name || !size || !mimeType || !totalParts || !sha256) {
+  if (!uploadId || !isValidUploadId(uploadId) || !name || !size || !mimeType || !totalParts || !sha256) {
     res.status(400).json({ error: "Eksik alanlar var" });
     return;
   }
