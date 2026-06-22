@@ -1,5 +1,6 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import rateLimit from "express-rate-limit";
+import bcrypt from "bcryptjs";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
@@ -91,6 +92,64 @@ const downloadLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Çok fazla indirme isteği. Lütfen bekleyin." },
 });
+
+// Rate limit for password unlock attempts — keyed per IP+fileId to prevent brute force
+const unlockLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla hatalı deneme. Lütfen 15 dakika bekleyin." },
+  keyGenerator: (req: Request) =>
+    `${req.ip ?? "unknown"}:${req.params["fileId"] ?? ""}`,
+});
+
+type FileMeta = import("../lib/fileStore.js").FileMeta;
+
+function canAccess(
+  meta: FileMeta,
+  req: Request,
+): { ok: true } | { ok: false; status: 401 | 403; body: object } {
+  const isOwner = !!req.session.userId && meta.userId === req.session.userId;
+  if (isOwner) return { ok: true };
+
+  if (meta.requireLogin && !req.session.userId) {
+    return {
+      ok: false,
+      status: 401,
+      body: {
+        error: "Bu dosyayı görüntülemek için giriş yapmanız gerekiyor",
+        requireLogin: true,
+      },
+    };
+  }
+
+  if (meta.passwordHash) {
+    const unlocked =
+      Array.isArray(req.session.unlockedFiles) &&
+      req.session.unlockedFiles.includes(meta.id);
+    if (!unlocked) {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: "Bu dosya şifre korumalı", requirePassword: true },
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+function buildPublicMeta(meta: FileMeta, req: Request) {
+  const { userId: _u, passwordHash: _p, ...rest } = meta;
+  const isOwner = !!req.session.userId && meta.userId === req.session.userId;
+  return {
+    ...rest,
+    isOwner,
+    requireLogin: !!meta.requireLogin,
+    hasPassword: !!meta.passwordHash,
+  };
+}
 
 function getBaseUrl(req: Request): string {
   // BUL-07: prefer ALLOWED_ORIGINS env to avoid Host header injection
@@ -566,7 +625,82 @@ router.get("/files/group/:groupId", requireAuth, async (req, res): Promise<void>
   res.json(versions);
 });
 
-router.get("/files/:fileId", requireAuth, async (req, res): Promise<void> => {
+router.get("/files/:fileId", async (req, res): Promise<void> => {
+  const { fileId } = req.params;
+  if (!fileId || !isValidFileId(fileId)) {
+    res.status(400).json({ error: "Geçersiz dosya ID'si" });
+    return;
+  }
+
+  const meta = readMeta(fileId);
+  if (!meta) {
+    res.status(404).json({ error: "Dosya bulunamadı" });
+    return;
+  }
+
+  if (isFileExpired(meta)) {
+    deleteFile(meta.id);
+    res.status(410).json({ error: "Dosyanın süresi doldu" });
+    return;
+  }
+
+  const access = canAccess(meta, req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  res.json(buildPublicMeta(meta, req));
+});
+
+router.post("/files/:fileId/unlock", unlockLimiter, async (req, res): Promise<void> => {
+  const { fileId } = req.params;
+  if (!fileId || !isValidFileId(fileId)) {
+    res.status(400).json({ error: "Geçersiz dosya ID'si" });
+    return;
+  }
+
+  const meta = readMeta(fileId);
+  if (!meta) {
+    res.status(404).json({ error: "Dosya bulunamadı" });
+    return;
+  }
+
+  if (isFileExpired(meta)) {
+    deleteFile(meta.id);
+    res.status(410).json({ error: "Dosyanın süresi doldu" });
+    return;
+  }
+
+  if (!meta.passwordHash) {
+    res.status(400).json({ error: "Bu dosya şifre korumalı değil" });
+    return;
+  }
+
+  const { password } = req.body as { password?: unknown };
+  if (!password || typeof password !== "string" || password.length > 256) {
+    res.status(400).json({ error: "Geçersiz şifre" });
+    return;
+  }
+
+  const valid = await bcrypt.compare(password, meta.passwordHash);
+  if (!valid) {
+    res.status(401).json({ error: "Yanlış şifre" });
+    return;
+  }
+
+  if (!Array.isArray(req.session.unlockedFiles)) {
+    req.session.unlockedFiles = [];
+  }
+  if (!req.session.unlockedFiles.includes(fileId)) {
+    req.session.unlockedFiles.push(fileId);
+  }
+
+  req.log.info({ fileId }, "File unlocked via password");
+  res.json({ ok: true });
+});
+
+router.patch("/files/:fileId/settings", requireAuth, async (req, res): Promise<void> => {
   const { fileId } = req.params;
   if (!fileId || !isValidFileId(fileId)) {
     res.status(400).json({ error: "Geçersiz dosya ID'si" });
@@ -583,13 +717,32 @@ router.get("/files/:fileId", requireAuth, async (req, res): Promise<void> => {
     return;
   }
 
-  if (isFileExpired(meta)) {
-    deleteFile(meta.id);
-    res.status(410).json({ error: "Dosyanın süresi doldu" });
-    return;
+  const { requireLogin, password } = req.body as {
+    requireLogin?: unknown;
+    password?: unknown;
+  };
+
+  if (typeof requireLogin === "boolean") {
+    meta.requireLogin = requireLogin;
   }
 
-  res.json(meta);
+  if (password !== undefined) {
+    if (password === null || password === "") {
+      delete meta.passwordHash;
+    } else if (typeof password === "string" && password.length >= 1 && password.length <= 128) {
+      meta.passwordHash = await bcrypt.hash(password, 12);
+    } else {
+      res.status(400).json({ error: "Şifre 1-128 karakter arasında olmalıdır" });
+      return;
+    }
+  }
+
+  saveMeta(meta);
+  req.log.info(
+    { fileId, requireLogin: meta.requireLogin, hasPassword: !!meta.passwordHash },
+    "File access settings updated",
+  );
+  res.json(buildPublicMeta(meta, req));
 });
 
 router.delete("/files/:fileId", requireAuth, async (req, res): Promise<void> => {
@@ -660,6 +813,12 @@ router.get("/files/:fileId/download", downloadLimiter, async (req, res): Promise
     return;
   }
 
+  const access = canAccess(meta, req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
   for (let i = 0; i < meta.chunkCount; i++) {
     if (!fs.existsSync(getChunkPath(fileId, i))) {
       res.status(500).json({ error: `Chunk ${i} eksik` });
@@ -710,6 +869,12 @@ router.get(
     if (isFileExpired(meta)) {
       deleteFile(meta.id);
       res.status(410).json({ error: "Dosyanın süresi doldu" });
+      return;
+    }
+
+    const access = canAccess(meta, req);
+    if (!access.ok) {
+      res.status(access.status).json(access.body);
       return;
     }
 

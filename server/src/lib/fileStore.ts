@@ -33,6 +33,8 @@ export interface FileMeta {
   groupId?: string;
   version?: number;
   folderId?: string;
+  requireLogin?: boolean;
+  passwordHash?: string;
 }
 
 export interface FolderMeta {

@@ -11,6 +11,7 @@ import { logger } from "./lib/logger.js";
 declare module "express-session" {
   interface SessionData {
     userId?: string;
+    unlockedFiles?: string[];
   }
 }
 

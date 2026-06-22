@@ -3,14 +3,18 @@ import { useParams, useLocation } from "wouter";
 import {
   Copy, Download, Trash2, Terminal, ArrowLeft, Layers,
   FileCode2, Check, Link2, Clock, Radio, WifiOff, Loader2, GitBranch, Plus,
+  Lock, Eye, EyeOff, Shield, LogIn, KeyRound,
 } from "lucide-react";
 import { format, formatDistanceToNow } from "date-fns";
 import { tr } from "date-fns/locale";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { toast } from "@/hooks/use-toast";
 import { Link } from "wouter";
+import { useAuth } from "@/hooks/use-auth";
 
 interface FileMeta {
   id: string;
@@ -26,6 +30,14 @@ interface FileMeta {
   groupId?: string;
   version?: number;
   chunkUrls?: string[];
+  isOwner: boolean;
+  requireLogin: boolean;
+  hasPassword: boolean;
+}
+
+interface AccessError {
+  requireLogin?: boolean;
+  requirePassword?: boolean;
 }
 
 interface VersionMeta {
@@ -241,27 +253,117 @@ function VersionHistory({ groupId, currentFileId }: { groupId: string; currentFi
 export default function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
   const [, setLocation] = useLocation();
+  const { user } = useAuth();
   const [file, setFile] = useState<FileMeta | null>(null);
   const [snippet, setSnippet] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [accessError, setAccessError] = useState<AccessError | null>(null);
+  const [unlockPassword, setUnlockPassword] = useState("");
+  const [showUnlockPw, setShowUnlockPw] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
   const [copiedSnippet, setCopiedSnippet] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedDirectLink, setCopiedDirectLink] = useState(false);
 
+  const [settingsRequireLogin, setSettingsRequireLogin] = useState(false);
+  const [settingsHasPassword, setSettingsHasPassword] = useState(false);
+  const [settingsNewPassword, setSettingsNewPassword] = useState("");
+  const [showSettingsPw, setShowSettingsPw] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+
+  const loadFile = (id: string) => {
+    setLoading(true);
+    setAccessError(null);
+    fetch(`/api/files/${id}`, { credentials: "include" })
+      .then(async (r) => {
+        if (r.ok) {
+          const meta = await r.json() as FileMeta;
+          setFile(meta);
+          setSettingsRequireLogin(meta.requireLogin);
+          setSettingsHasPassword(meta.hasPassword);
+          if (!meta.seedOnly && meta.isOwner) {
+            fetch(`/api/files/${id}/snippet`, { credentials: "include" })
+              .then((sr) => sr.ok ? sr.json() : null)
+              .then((d) => setSnippet((d as { snippet?: string } | null)?.snippet ?? null))
+              .catch(() => {});
+          }
+        } else {
+          const err = await r.json() as AccessError & { error?: string };
+          if (err.requireLogin) {
+            setAccessError({ requireLogin: true });
+          } else if (err.requirePassword) {
+            setAccessError({ requirePassword: true });
+          } else {
+            setFile(null);
+          }
+        }
+      })
+      .catch(() => setFile(null))
+      .finally(() => setLoading(false));
+  };
+
   useEffect(() => {
     if (!fileId) return;
-    Promise.all([
-      fetch(`/api/files/${fileId}`, { credentials: "include" }).then((r) => r.ok ? r.json() : null),
-    ]).then(([meta]) => {
-      setFile(meta as FileMeta | null);
-      if (meta && !(meta as FileMeta).seedOnly) {
-        fetch(`/api/files/${fileId}/snippet`, { credentials: "include" })
-          .then((r) => r.ok ? r.json() : null)
-          .then((d) => setSnippet((d as { snippet?: string } | null)?.snippet ?? null))
-          .catch(() => {});
-      }
-    }).catch(() => setFile(null)).finally(() => setLoading(false));
+    loadFile(fileId);
   }, [fileId]);
+
+  const unlockFile = async () => {
+    if (!fileId || !unlockPassword) return;
+    setUnlocking(true);
+    try {
+      const res = await fetch(`/api/files/${fileId}/unlock`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ password: unlockPassword }),
+      });
+      if (res.ok) {
+        setUnlockPassword("");
+        loadFile(fileId);
+      } else {
+        const err = await res.json() as { error?: string };
+        toast({ variant: "destructive", title: err.error ?? "Yanlış şifre" });
+      }
+    } catch {
+      toast({ variant: "destructive", title: "Bağlantı hatası" });
+    } finally {
+      setUnlocking(false);
+    }
+  };
+
+  const saveSettings = async () => {
+    if (!fileId || !file) return;
+    setSavingSettings(true);
+    try {
+      const body: Record<string, unknown> = { requireLogin: settingsRequireLogin };
+      if (!settingsHasPassword) {
+        body.password = null;
+      } else if (settingsNewPassword) {
+        body.password = settingsNewPassword;
+      }
+      const res = await fetch(`/api/files/${fileId}/settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        const updated = await res.json() as FileMeta;
+        setFile(updated);
+        setSettingsRequireLogin(updated.requireLogin);
+        setSettingsHasPassword(updated.hasPassword);
+        setSettingsNewPassword("");
+        toast({ title: "Erişim ayarları kaydedildi" });
+      } else {
+        const err = await res.json() as { error?: string };
+        toast({ variant: "destructive", title: err.error ?? "Kaydetme başarısız" });
+      }
+    } catch {
+      toast({ variant: "destructive", title: "Bağlantı hatası" });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
 
   const deleteFile = async () => {
     if (!file || !confirm(`"${file.name}" silinsin mi?`)) return;
@@ -293,12 +395,81 @@ export default function FileDetailPage() {
     );
   }
 
+  if (accessError?.requireLogin) {
+    return (
+      <div className="max-w-md mx-auto py-24 text-center space-y-5">
+        <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mx-auto">
+          <LogIn className="w-6 h-6 text-primary" />
+        </div>
+        <div>
+          <h2 className="text-lg font-mono font-bold mb-1">Giriş Gerekli</h2>
+          <p className="text-sm text-muted-foreground">Bu dosyayı görüntülemek için bir hesabınızın olması gerekiyor.</p>
+        </div>
+        {user ? (
+          <p className="text-xs text-muted-foreground font-mono">Hesabınız bu dosyaya erişim iznine sahip değil.</p>
+        ) : (
+          <Link href="/login">
+            <Button className="gap-2 font-mono text-xs">
+              <LogIn className="w-3.5 h-3.5" /> Giriş Yap
+            </Button>
+          </Link>
+        )}
+      </div>
+    );
+  }
+
+  if (accessError?.requirePassword) {
+    return (
+      <div className="max-w-md mx-auto py-24 space-y-6">
+        <div className="text-center space-y-4">
+          <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mx-auto">
+            <Lock className="w-6 h-6 text-primary" />
+          </div>
+          <div>
+            <h2 className="text-lg font-mono font-bold mb-1">Şifre Korumalı Dosya</h2>
+            <p className="text-sm text-muted-foreground">Bu dosyayı görüntülemek için şifreyi girmeniz gerekiyor.</p>
+          </div>
+        </div>
+        <Card className="border-primary/20">
+          <CardContent className="pt-6 space-y-4">
+            <div className="relative">
+              <Input
+                type={showUnlockPw ? "text" : "password"}
+                placeholder="Dosya şifresi"
+                value={unlockPassword}
+                onChange={(e) => setUnlockPassword(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && unlockFile()}
+                className="font-mono text-sm pr-10"
+                autoFocus
+              />
+              <button
+                type="button"
+                onClick={() => setShowUnlockPw((p) => !p)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                {showUnlockPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+            <Button
+              className="w-full gap-2 font-mono text-xs"
+              onClick={unlockFile}
+              disabled={!unlockPassword || unlocking}
+            >
+              {unlocking ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+              {unlocking ? "Doğrulanıyor..." : "Dosyayı Aç"}
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   if (!file) {
     return (
       <div className="text-center py-24">
         <FileCode2 className="w-12 h-12 text-muted-foreground/40 mx-auto mb-4" />
         <h2 className="text-xl font-mono font-bold mb-2">Dosya bulunamadı</h2>
-        <p className="text-muted-foreground text-sm mb-6">Bu dosya mevcut değil, silinmiş ya da size ait değil.</p>
+        <p className="text-muted-foreground text-sm mb-6">Bu dosya mevcut değil, silinmiş ya da süresi dolmuş.</p>
         <Link href="/files"><Button className="font-mono text-xs">Kütüphaneye Dön</Button></Link>
       </div>
     );
@@ -368,9 +539,11 @@ export default function FileDetailPage() {
               </Button>
             </a>
           )}
-          <Button size="sm" variant="destructive" className="gap-2 text-xs font-mono" onClick={deleteFile}>
-            <Trash2 className="w-3.5 h-3.5" /> Sil
-          </Button>
+          {file.isOwner && (
+            <Button size="sm" variant="destructive" className="gap-2 text-xs font-mono" onClick={deleteFile}>
+              <Trash2 className="w-3.5 h-3.5" /> Sil
+            </Button>
+          )}
         </div>
       </div>
 
@@ -390,7 +563,7 @@ export default function FileDetailPage() {
             </Card>
           ) : (
             <>
-              {snippet && (
+              {file.isOwner && snippet && (
                 <Card className="border-border/60 bg-card/60">
                   <CardHeader className="pb-3">
                     <CardTitle className="flex items-center gap-2 font-mono text-sm">
@@ -467,7 +640,7 @@ export default function FileDetailPage() {
             </CardContent>
           </Card>
 
-          {file.groupId && <VersionHistory groupId={file.groupId} currentFileId={fileId} />}
+          {file.isOwner && file.groupId && <VersionHistory groupId={file.groupId} currentFileId={fileId} />}
 
           <Card className="border-border/60 bg-card/60">
             <CardHeader className="pb-3">
@@ -508,6 +681,74 @@ export default function FileDetailPage() {
                     <Download className="w-3.5 h-3.5" /> Dosyayı İndir
                   </Button>
                 </a>
+              </CardContent>
+            </Card>
+          )}
+
+          {file.isOwner && (
+            <Card className="border-border/60 bg-card/60">
+              <CardHeader className="pb-3">
+                <CardTitle className="font-mono text-sm flex items-center gap-2">
+                  <Shield className="w-3.5 h-3.5 text-primary" /> Erişim Ayarları
+                </CardTitle>
+                <CardDescription className="text-xs">Bu dosyaya kimlerin erişebileceğini belirleyin.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-mono font-medium">Yalnızca üyelere göster</p>
+                    <p className="text-[11px] text-muted-foreground mt-0.5">Açık olduğunda yalnızca giriş yapmış kullanıcılar dosyayı görebilir.</p>
+                  </div>
+                  <Switch
+                    checked={settingsRequireLogin}
+                    onCheckedChange={setSettingsRequireLogin}
+                  />
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-mono font-medium">Şifre koruması</p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5">Dosyayı açmak için şifre girilmesi zorunlu olur.</p>
+                    </div>
+                    <Switch
+                      checked={settingsHasPassword}
+                      onCheckedChange={(v) => {
+                        setSettingsHasPassword(v);
+                        if (!v) setSettingsNewPassword("");
+                      }}
+                    />
+                  </div>
+
+                  {settingsHasPassword && (
+                    <div className="relative">
+                      <Input
+                        type={showSettingsPw ? "text" : "password"}
+                        placeholder={file.hasPassword ? "Yeni şifre (boş bırakılırsa değişmez)" : "Şifre belirleyin"}
+                        value={settingsNewPassword}
+                        onChange={(e) => setSettingsNewPassword(e.target.value)}
+                        className="font-mono text-xs pr-10"
+                        maxLength={128}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowSettingsPw((p) => !p)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      >
+                        {showSettingsPw ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <Button
+                  className="w-full gap-2 text-xs font-mono"
+                  onClick={saveSettings}
+                  disabled={savingSettings || (settingsHasPassword && !settingsNewPassword && !file.hasPassword)}
+                >
+                  {savingSettings ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                  {savingSettings ? "Kaydediliyor..." : "Ayarları Kaydet"}
+                </Button>
               </CardContent>
             </Card>
           )}

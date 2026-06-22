@@ -36,6 +36,22 @@ function ProtectedRoute({ component: Component }: { component: React.ComponentTy
   );
 }
 
+function PublicRoute({ component: Component }: { component: React.ComponentType }) {
+  const { loading } = useAuth();
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+  return (
+    <Layout>
+      <Component />
+    </Layout>
+  );
+}
+
 function Router() {
   const { user, loading } = useAuth();
 
@@ -53,7 +69,7 @@ function Router() {
       <Route path="/register" component={user ? () => <Redirect to="/" /> : RegisterPage} />
       <Route path="/" component={() => <ProtectedRoute component={UploadPage} />} />
       <Route path="/files" component={() => <ProtectedRoute component={FileListPage} />} />
-      <Route path="/files/:fileId" component={() => <ProtectedRoute component={FileDetailPage} />} />
+      <Route path="/files/:fileId" component={() => <PublicRoute component={FileDetailPage} />} />
       <Route component={NotFound} />
     </Switch>
   );
