@@ -3,12 +3,14 @@ import type { IncomingMessage, Server } from "http";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "./logger.js";
 import { isValidFileId, readMeta } from "./fileStore.js";
+import { sessionMiddleware } from "./sessionMiddleware.js";
 
 interface Client {
   id: string;
   ws: WebSocket;
   role?: "seeder" | "leecher";
   fileId?: string;
+  userId?: string;  // BUL-02: verified from session at connection time
 }
 
 const clients = new Map<string, Client>();
@@ -23,9 +25,21 @@ function send(ws: WebSocket, data: object) {
 export function attachSignalingServer(httpServer: Server) {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
-  wss.on("connection", (ws: WebSocket, _req: IncomingMessage) => {
+  wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     const clientId = uuidv4();
-    const client: Client = { id: clientId, ws };
+
+    // BUL-02: extract authenticated userId from the session cookie
+    let userId: string | undefined;
+    try {
+      await new Promise<void>((resolve) =>
+        sessionMiddleware(req as Parameters<typeof sessionMiddleware>[0], {} as Parameters<typeof sessionMiddleware>[1], () => resolve())
+      );
+      userId = (req as Record<string, unknown> & { session?: { userId?: string } })?.session?.userId;
+    } catch {
+      // session read failure is non-fatal — client just won't be allowed to seed
+    }
+
+    const client: Client = { id: clientId, ws, userId };
     clients.set(clientId, client);
 
     send(ws, { type: "connected", clientId });
@@ -42,9 +56,19 @@ export function attachSignalingServer(httpServer: Server) {
 
       if (type === "seed") {
         const fileId = msg["fileId"] as string;
-        // BUL-02: validate fileId format and file existence before registering seeder
-        if (!fileId || !isValidFileId(fileId) || !readMeta(fileId)) {
-          send(ws, { type: "error", message: "Geçersiz veya bulunamayan dosya" });
+        if (!fileId || !isValidFileId(fileId)) {
+          send(ws, { type: "error", message: "Geçersiz dosya kimliği" });
+          return;
+        }
+        const fileMeta = readMeta(fileId);
+        if (!fileMeta) {
+          send(ws, { type: "error", message: "Dosya bulunamadı" });
+          return;
+        }
+        // BUL-02: verify the connecting client is the actual file owner
+        if (!client.userId || fileMeta.userId !== client.userId) {
+          send(ws, { type: "error", message: "Bu dosyanın sahibi değilsiniz" });
+          logger.warn({ clientId, fileId, clientUserId: client.userId, fileOwner: fileMeta.userId }, "Unauthorized seed attempt");
           return;
         }
         client.role = "seeder";

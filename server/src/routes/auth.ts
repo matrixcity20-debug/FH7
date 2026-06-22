@@ -52,6 +52,10 @@ router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
   try {
     const user = await createUser(trimmedUsername, passwordHash);
 
+    // BUL-14: regenerate session ID to prevent session fixation
+    await new Promise<void>((resolve, reject) => {
+      req.session.regenerate((err) => (err ? reject(err) : resolve()));
+    });
     req.session.userId = user.id;
 
     req.log.info({ userId: user.id, username: user.username }, "User registered");
@@ -76,6 +80,8 @@ router.post("/auth/login", authLimiter, async (req, res): Promise<void> => {
 
   const user = await findUserByUsername(username.trim());
   if (!user) {
+    // BUL-15: always run bcrypt to prevent username enumeration via timing side-channel
+    await bcrypt.compare(password, "$2b$12$invalidhashpaddinginvalidhashpaddinginvalidhashpaddingXX");
     res.status(401).json({ error: "Kullanıcı adı veya şifre hatalı" });
     return;
   }
@@ -86,6 +92,10 @@ router.post("/auth/login", authLimiter, async (req, res): Promise<void> => {
     return;
   }
 
+  // BUL-14: regenerate session ID to prevent session fixation
+  await new Promise<void>((resolve, reject) => {
+    req.session.regenerate((err) => (err ? reject(err) : resolve()));
+  });
   req.session.userId = user.id;
   req.log.info({ userId: user.id }, "User logged in");
   res.json({ id: user.id, username: user.username });

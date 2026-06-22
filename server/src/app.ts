@@ -1,15 +1,12 @@
 import express, { type Express } from "express";
 import cors from "cors";
-import session from "express-session";
-import FileStore from "session-file-store";
+import { sessionMiddleware } from "./lib/sessionMiddleware.js";
 import helmet from "helmet";
 import pinoHttp from "pino-http";
 import path from "path";
 import router from "./routes/index.js";
 import { logger } from "./lib/logger.js";
-import { uploadsDir, ensureUploadsDir } from "./lib/fileStore.js";
 
-const SessionFileStore = FileStore(session);
 
 declare module "express-session" {
   interface SessionData {
@@ -27,7 +24,7 @@ app.use(
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'"],  // BUL-06: unsafe-inline removed — Vite prod build uses module scripts only
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", "data:", "blob:"],
         mediaSrc: ["'self'", "blob:"],
@@ -78,34 +75,8 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
-const sessionSecret = process.env["SESSION_SECRET"];
-if (!sessionSecret) {
-  throw new Error("SESSION_SECRET environment variable is required");
-}
-
-ensureUploadsDir();
-const sessionsDir = path.join(uploadsDir, "_sessions");
-
-app.use(
-  session({
-    store: new SessionFileStore({
-      path: sessionsDir,
-      ttl: 7 * 24 * 60 * 60,
-      retries: 1,
-      logFn: () => {},
-    }),
-    name: "fs.sid",
-    secret: sessionSecret,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: process.env["NODE_ENV"] === "production",
-      sameSite: "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    },
-  }),
-);
+// BUL-02: shared session middleware (also used by WebSocket signaling server)
+app.use(sessionMiddleware);
 
 app.use("/api", router);
 

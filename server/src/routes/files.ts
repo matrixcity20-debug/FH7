@@ -1,4 +1,5 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
+import rateLimit from "express-rate-limit";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
@@ -17,6 +18,8 @@ import {
   isValidFileId,
   CHUNK_SIZE,
   MAX_FILE_SIZE,
+  MAX_USER_STORAGE_BYTES,
+  getUserStorageUsed,
   UPLOAD_PART_SIZE,
   uploadsDir,
   getUploadTempDir,
@@ -70,6 +73,25 @@ const TTL_OPTIONS: Record<string, number> = {
 const MAX_CHUNK_COUNT = 10_000;
 const MAX_SEED_SIZE = 50 * 1024 * 1024 * 1024;
 
+// BUL-08: per-user upload rate limit (50 uploads/hour)
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla yükleme denemesi. Lütfen bir saat bekleyin." },
+  keyGenerator: (req: Request) => (req.session as Record<string, unknown>)?.["userId"] as string ?? req.ip ?? "unknown",
+});
+
+// BUL-04: download rate limit — endpoint intentionally public for embed/P2P but rate-limited
+const downloadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla indirme isteği. Lütfen bekleyin." },
+});
+
 function getBaseUrl(req: Request): string {
   // BUL-07: prefer ALLOWED_ORIGINS env to avoid Host header injection
   const allowedOrigins = process.env["ALLOWED_ORIGINS"];
@@ -81,6 +103,25 @@ function getBaseUrl(req: Request): string {
   const forwardedProto = req.get("x-forwarded-proto");
   const protocol = forwardedProto ?? req.protocol ?? "http";
   return `${protocol}://${host}`;
+}
+
+// BUL-08: shared per-user storage quota check, used by all endpoints that
+// persist file bytes to disk (register-seed is exempt — it stores no bytes,
+// only metadata for P2P seeding).
+function checkUserQuota(
+  userId: string,
+  incomingBytes: number,
+): { ok: true } | { ok: false; message: string } {
+  const used = getUserStorageUsed(userId);
+  if (used + incomingBytes <= MAX_USER_STORAGE_BYTES) {
+    return { ok: true };
+  }
+  const usedMb = (used / 1024 / 1024).toFixed(1);
+  const limitMb = Math.round(MAX_USER_STORAGE_BYTES / 1024 / 1024);
+  return {
+    ok: false,
+    message: `Depolama kotanız doldu (${usedMb} MB / ${limitMb} MB kullanılıyor). Devam etmek için bazı dosyaları silin.`,
+  };
 }
 
 router.get("/folders", requireAuth, async (req, res): Promise<void> => {
@@ -185,6 +226,7 @@ router.patch("/files/:fileId/folder", requireAuth, async (req, res): Promise<voi
 router.post(
   "/files/upload",
   requireAuth,
+  uploadLimiter,
   upload.single("file"),
   async (req, res): Promise<void> => {
     if (!req.file) {
@@ -193,6 +235,16 @@ router.post(
     }
 
     const tempPath = path.join(uploadsDir, req.file.filename);
+
+    // BUL-08: enforce per-user storage quota using the real, measured upload
+    // size (req.file.size comes from multer after the bytes are on disk, not
+    // a client-supplied claim).
+    const quota = checkUserQuota(req.session.userId as string, req.file.size);
+    if (!quota.ok) {
+      try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+      res.status(413).json({ error: quota.message });
+      return;
+    }
 
     try {
       ensureUploadsDir();
@@ -208,8 +260,13 @@ router.post(
         expiresAt = new Date(Date.now() + TTL_OPTIONS[ttlKey]).toISOString();
       }
 
-      const folderId = typeof req.body?.folderId === "string" && isValidFolderId(req.body.folderId)
+      // BUL-16: verify the folder actually belongs to the uploading user
+      // before assigning the file to it (previously only checked that the
+      // folder existed, not who owned it).
+      const requestedFolderId = typeof req.body?.folderId === "string" && isValidFolderId(req.body.folderId)
         ? req.body.folderId : undefined;
+      const requestedFolderMeta = requestedFolderId ? readFolderMeta(requestedFolderId) : null;
+      const folderId = requestedFolderMeta?.userId === req.session.userId ? requestedFolderId : undefined;
 
       const meta: FileMeta = {
         id: fileId,
@@ -236,7 +293,7 @@ router.post(
   },
 );
 
-router.post("/files/upload-init", requireAuth, async (req, res): Promise<void> => {
+router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): Promise<void> => {
   const { name, size, mimeType } = req.body as {
     name: string;
     size: number;
@@ -253,6 +310,16 @@ router.post("/files/upload-init", requireAuth, async (req, res): Promise<void> =
   }
   if (!mimeType || typeof mimeType !== "string") {
     res.status(400).json({ error: "Geçersiz MIME türü" });
+    return;
+  }
+
+  // BUL-08: early/soft quota check using the client-declared size, so an
+  // obviously-over-quota upload is rejected before the user spends time
+  // uploading parts. The authoritative check happens again at finalize time
+  // using the real, server-measured size.
+  const earlyQuota = checkUserQuota(req.session.userId as string, size);
+  if (!earlyQuota.ok) {
+    res.status(413).json({ error: earlyQuota.message });
     return;
   }
 
@@ -284,6 +351,7 @@ const partUpload = multer({
 router.post(
   "/files/upload-part",
   requireAuth,
+  uploadLimiter,
   partUpload.single("part"),
   async (req, res): Promise<void> => {
     const { uploadId } = req.body as { uploadId: string };
@@ -303,7 +371,7 @@ router.post(
   },
 );
 
-router.post("/files/upload-finalize", requireAuth, async (req, res): Promise<void> => {
+router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, res): Promise<void> => {
   const { uploadId, name, size, mimeType, totalParts, sha256, ttl, parentFileId, folderId } = req.body as {
     uploadId: string;
     name: string;
@@ -342,9 +410,12 @@ router.post("/files/upload-finalize", requireAuth, async (req, res): Promise<voi
 
     const { createHash } = await import("crypto");
     const fileHash = createHash("sha256");
+    let measuredBytes = 0;
     for (let i = 0; i < chunkCount; i++) {
       const chunkPath = path.join(uploadsDir, fileId, `chunk_${i}.bin`);
-      fileHash.update(fs.readFileSync(chunkPath));
+      const chunkBuf = fs.readFileSync(chunkPath);
+      fileHash.update(chunkBuf);
+      measuredBytes += chunkBuf.length;
     }
     const serverHash = fileHash.digest("hex");
 
@@ -352,6 +423,17 @@ router.post("/files/upload-finalize", requireAuth, async (req, res): Promise<voi
       deleteFile(fileId);
       req.log.warn({ uploadId, fileId }, "SHA-256 mismatch");
       res.status(409).json({ error: "Bütünlük kontrolü başarısız: SHA-256 uyuşmuyor. Lütfen tekrar deneyin." });
+      return;
+    }
+
+    // BUL-08: authoritative quota check using the real, measured byte count
+    // (not the client-declared `size`), now that the file is fully assembled
+    // on disk. The early check in upload-init only catches the obvious case;
+    // this is what actually enforces the limit.
+    const finalQuota = checkUserQuota(req.session.userId as string, measuredBytes);
+    if (!finalQuota.ok) {
+      deleteFile(fileId);
+      res.status(413).json({ error: finalQuota.message });
       return;
     }
 
@@ -379,15 +461,16 @@ router.post("/files/upload-finalize", requireAuth, async (req, res): Promise<voi
       }
     }
 
-    const resolvedFolderId = folderId && isValidFolderId(folderId) && readFolderMeta(folderId)
-      ? folderId : undefined;
+    const _finalizeFolderMeta = folderId && isValidFolderId(folderId) ? readFolderMeta(folderId) : null;
+    // BUL-16: verify folder belongs to current user in upload-finalize
+    const resolvedFolderId = _finalizeFolderMeta?.userId === req.session.userId ? folderId : undefined;
 
     const chunkUrls = buildChunkUrls(fileId, chunkCount, baseUrl);
     const meta: FileMeta = {
       id: fileId,
       userId: req.session.userId,
       name,
-      size: Number(size),
+      size: measuredBytes,
       mimeType: mimeType || "application/octet-stream",
       chunkCount,
       chunkSize: CHUNK_SIZE,
@@ -410,7 +493,7 @@ router.post("/files/upload-finalize", requireAuth, async (req, res): Promise<voi
   }
 });
 
-router.post("/files/register-seed", requireAuth, async (req, res): Promise<void> => {
+router.post("/files/register-seed", requireAuth, uploadLimiter, async (req, res): Promise<void> => {
   const { name, size, mimeType, chunkCount, folderId } = req.body as {
     name: string;
     size: number;
@@ -438,8 +521,9 @@ router.post("/files/register-seed", requireAuth, async (req, res): Promise<void>
 
   ensureUploadsDir();
   const fileId = uuidv4();
-  const resolvedFolderId = folderId && isValidFolderId(folderId) && readFolderMeta(folderId)
-    ? folderId : undefined;
+  const resolvedFolderMeta = folderId && isValidFolderId(folderId) ? readFolderMeta(folderId) : null;
+    // BUL-16: verify folder belongs to current user before assigning
+    const resolvedFolderId = resolvedFolderMeta?.userId === req.session.userId ? folderId : undefined;
 
   const meta: FileMeta = {
     id: fileId,
@@ -558,7 +642,7 @@ router.get("/files/:fileId/snippet", requireAuth, async (req, res): Promise<void
   res.json({ fileId: meta.id, snippet });
 });
 
-router.get("/files/:fileId/download", async (req, res): Promise<void> => {
+router.get("/files/:fileId/download", downloadLimiter, async (req, res): Promise<void> => {
   const { fileId } = req.params;
   if (!fileId || !isValidFileId(fileId)) {
     res.status(400).json({ error: "Geçersiz dosya ID'si" });
@@ -606,6 +690,7 @@ router.get("/files/:fileId/download", async (req, res): Promise<void> => {
 
 router.get(
   "/files/:fileId/chunks/:chunkIndex",
+  downloadLimiter,
   async (req, res): Promise<void> => {
     const { fileId } = req.params;
     const rawIdx = req.params.chunkIndex;

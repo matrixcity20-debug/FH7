@@ -13,6 +13,10 @@ export const CHUNK_SIZE =
 export const MAX_FILE_SIZE =
   Math.max(1, Math.min(2000, Number(process.env["MAX_FILE_SIZE_MB"] ?? 500))) * 1024 * 1024;
 
+// BUL-08: per-user total storage quota (default 5 GB, overridable via env)
+export const MAX_USER_STORAGE_BYTES =
+  Math.max(1, Number(process.env["MAX_USER_STORAGE_MB"] ?? 5000)) * 1024 * 1024;
+
 export interface FileMeta {
   id: string;
   userId?: string;
@@ -184,6 +188,12 @@ export function listAllFiles(userId?: string): FileMeta[] {
   );
 }
 
+// BUL-08: sum of all active (non-expired) file sizes owned by a user, used to
+// enforce the per-user storage quota (MAX_USER_STORAGE_BYTES) at upload time.
+export function getUserStorageUsed(userId: string): number {
+  return listAllFiles(userId).reduce((total, f) => total + (f.size || 0), 0);
+}
+
 export function deleteFile(fileId: string): boolean {
   if (!isValidFileId(fileId)) return false;
   const dir = getFileDir(fileId);
@@ -303,13 +313,38 @@ export function assembleAndSplit(uploadId: string, fileId: string, totalParts: n
   return splitAndSaveFromPath(fileId, assembledPath);
 }
 
+/**
+ * BUL-12 (hardened): safely embed an arbitrary JS value as a JSON literal
+ * inside a <script> block.
+ *
+ * Pattern-matching a single substring like "</script>" is fragile — it
+ * misses case/whitespace variants, other closing tags ("</style>"), and
+ * comment-open sequences ("<!--") that can also confuse an HTML parser
+ * scanning raw bytes for the next tag. The robust, OWASP-recommended fix is
+ * to escape *every* '<' character in the JSON output to its Unicode escape
+ * (\u003C). A '\u003C' is valid inside a JS string literal and evaluates
+ * back to '<' at runtime, but it can never be mistaken for the start of an
+ * HTML tag by a parser scanning the raw source text — regardless of what
+ * tag name, case, or whitespace follows it.
+ */
+function toSafeScriptLiteral(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, "\\u003C");
+}
+
 export function generateSnippet(meta: FileMeta, baseUrl: string): string {
+  // name and mimeType originate from the uploader's own request (originalname /
+  // multipart Content-Type) and baseUrl is derived from request headers — all
+  // three are escaped defensively, even though /snippet is only ever exposed
+  // to the file's owner.
+  const safeNameJson = toSafeScriptLiteral(meta.name);
+  const safeMimeJson = toSafeScriptLiteral(meta.mimeType);
+  const safeBaseUrlJson = toSafeScriptLiteral(baseUrl);
   return `(function() {
   var fileId = "${meta.id}";
-  var fileName = ${JSON.stringify(meta.name.replace(/<\/script>/gi, "<\/scr\"+"ipt>"))};
-  var mimeType = ${JSON.stringify(meta.mimeType)};
+  var fileName = ${safeNameJson};
+  var mimeType = ${safeMimeJson};
   var chunkCount = ${meta.chunkCount};
-  var baseUrl = ${JSON.stringify(baseUrl)};
+  var baseUrl = ${safeBaseUrlJson};
 
   function downloadFile() {
     var promises = [];

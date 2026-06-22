@@ -35,6 +35,11 @@ function usernameIndexKey(username: string): string {
   return createHash("sha256").update(username.toLowerCase()).digest("hex");
 }
 
+// BUL-17: exposed so the standalone migration script (scripts/migrate-local-
+// to-firebase.ts) can compute the same index key Firebase itself uses,
+// without duplicating the hashing logic.
+export { usernameIndexKey };
+
 // ---------------------------------------------------------------------------
 // Yerel dosya deposu (fallback)
 // ---------------------------------------------------------------------------
@@ -52,6 +57,12 @@ function loadLocalUsers(): User[] {
   } catch {
     return [];
   }
+}
+
+// BUL-17: read-only accessor for the migration script — lets it enumerate
+// every locally-stored account without duplicating the file-parsing logic.
+export function loadAllLocalUsers(): User[] {
+  return loadLocalUsers();
 }
 
 function saveLocalUsers(users: User[]): void {
@@ -171,11 +182,69 @@ export async function findUserById(id: string): Promise<User | null> {
 
 export async function createUser(username: string, passwordHash: string): Promise<User> {
   if (getFirebaseDb()) {
+    // BUL-17: never fall back to local store for writes — throw so the caller
+    // handles the error rather than creating a split account in both stores
     return createUserFirebase(username, passwordHash);
   }
   return createUserLocal(username, passwordHash);
 }
 
+/**
+ * BUL-17: migrate a single pre-existing local user record into Firebase,
+ * preserving its original id/createdAt (unlike createUserFirebase, which
+ * always mints a fresh id for a brand-new signup).
+ *
+ * Used exclusively by scripts/migrate-local-to-firebase.ts when an operator
+ * switches a deployment from the local JSON store to Firebase after real
+ * users have already accumulated locally. Without running this first, those
+ * local accounts are invisible to Firebase's usernameIndex and someone else
+ * could register the same username as a brand-new (different) account —
+ * the account-confusion risk this migration tooling exists to close.
+ *
+ * Uses the same atomic transaction as createUserFirebase, so concurrent
+ * migration runs (or a real signup racing a migration) can never both win.
+ */
+export type MigrationResult = "migrated" | "already-migrated" | "conflict" | "no-firebase";
+
+export async function migrateUserToFirebase(user: User): Promise<MigrationResult> {
+  const db = getFirebaseDb();
+  if (!db) return "no-firebase";
+
+  const indexRef = db.ref(`usernameIndex/${usernameIndexKey(user.username)}`);
+
+  // RTDB transactions may re-invoke this callback on contention; capturing
+  // the last-seen value here is fine since we only read it once committed.
+  let existingOwnerId: string | null = null;
+  const txResult = await indexRef.transaction((current) => {
+    if (current !== null) {
+      existingOwnerId = current as string;
+      return undefined; // abort — slot already taken
+    }
+    return user.id;
+  });
+
+  if (!txResult.committed) {
+    // Re-running the script is expected (idempotent ops). If the slot is
+    // already taken by THIS SAME user's id, that's our own earlier
+    // migration, not a real collision with a different identity.
+    return existingOwnerId === user.id ? "already-migrated" : "conflict";
+  }
+
+  try {
+    await db.ref(`users/${user.id}`).set(user);
+  } catch (err) {
+    await indexRef.remove().catch(() => {});
+    throw err;
+  }
+
+  return "migrated";
+}
+
 export async function usernameExists(username: string): Promise<boolean> {
-  return (await findUserByUsername(username)) !== null;
+  // BUL-17: when Firebase is configured, query Firebase directly (no local fallback)
+  // to prevent duplicate accounts being created across both stores
+  if (getFirebaseDb()) {
+    return (await findUserByUsernameFirebase(username)) !== null;
+  }
+  return findUserByUsernameLocal(username) !== null;
 }
