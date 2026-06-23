@@ -3,6 +3,7 @@ import { Link, useLocation } from "wouter";
 import {
   HardDrive, Trash2, ChevronRight, File, Clock, Plus,
   GitBranch, Folder, FolderOpen, FolderPlus, ArrowLeft, X,
+  Database, UploadCloud, Layers,
 } from "lucide-react";
 import { format, formatDistanceToNow } from "date-fns";
 import { tr } from "date-fns/locale";
@@ -36,12 +37,87 @@ interface FolderMeta {
   createdAt: string;
 }
 
+interface StorageStats {
+  usedBytes: number;
+  totalBytes: number;
+  freeBytes: number;
+  maxFileSizeBytes: number;
+  chunkSizeBytes: number;
+}
+
+function StoragePanel({ stats }: { stats: StorageStats | null }) {
+  if (!stats) {
+    return (
+      <div className="p-4 rounded-xl border border-border/60 bg-card/60 animate-pulse h-24" />
+    );
+  }
+
+  const usedPct = Math.min(100, (stats.usedBytes / stats.totalBytes) * 100);
+  const isNearFull = usedPct >= 80;
+  const isCritical = usedPct >= 95;
+
+  const barColor = isCritical
+    ? "bg-destructive"
+    : isNearFull
+    ? "bg-amber-500"
+    : "bg-primary";
+
+  return (
+    <div className="rounded-xl border border-border/60 bg-card/60 p-5 space-y-4">
+      <div className="flex items-center gap-2">
+        <div className="w-7 h-7 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center">
+          <Database className="w-3.5 h-3.5 text-primary" />
+        </div>
+        <h2 className="text-sm font-semibold font-mono text-foreground">Depolama Alanı</h2>
+      </div>
+
+      <div className="space-y-1.5">
+        <div className="flex justify-between items-center text-xs font-mono">
+          <span className="text-muted-foreground">
+            {formatBytes(stats.usedBytes)} kullanıldı
+          </span>
+          <span className={isCritical ? "text-destructive font-semibold" : isNearFull ? "text-amber-400 font-semibold" : "text-muted-foreground"}>
+            {formatBytes(stats.freeBytes)} boş
+          </span>
+        </div>
+        <div className="h-2 w-full rounded-full bg-muted/60 overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-all duration-500 ${barColor}`}
+            style={{ width: `${usedPct}%` }}
+          />
+        </div>
+        <div className="text-right text-[10px] font-mono text-muted-foreground/60">
+          {formatBytes(stats.totalBytes)} toplam
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 pt-1">
+        <div className="flex items-start gap-2.5 p-3 rounded-lg border border-border/50 bg-muted/20">
+          <UploadCloud className="w-3.5 h-3.5 text-muted-foreground shrink-0 mt-0.5" />
+          <div>
+            <p className="text-[10px] text-muted-foreground font-mono leading-tight">Maks. Dosya Boyutu</p>
+            <p className="text-xs font-semibold font-mono text-foreground mt-0.5">{formatBytes(stats.maxFileSizeBytes)}</p>
+          </div>
+        </div>
+        <div className="flex items-start gap-2.5 p-3 rounded-lg border border-border/50 bg-muted/20">
+          <Layers className="w-3.5 h-3.5 text-muted-foreground shrink-0 mt-0.5" />
+          <div>
+            <p className="text-[10px] text-muted-foreground font-mono leading-tight">Parça Boyutu</p>
+            <p className="text-xs font-semibold font-mono text-foreground mt-0.5">{formatBytes(stats.chunkSizeBytes)}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function FileListPage() {
   const [, setLocation] = useLocation();
 
   const [files, setFiles] = useState<FileMeta[]>([]);
   const [folders, setFolders] = useState<FolderMeta[]>([]);
   const [loading, setLoading] = useState(true);
+  const [storageStats, setStorageStats] = useState<StorageStats | null>(null);
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
@@ -51,12 +127,14 @@ export default function FileListPage() {
 
   const loadData = async () => {
     try {
-      const [filesRes, foldersRes] = await Promise.all([
+      const [filesRes, foldersRes, storageRes] = await Promise.all([
         fetch("/api/files", { credentials: "include" }),
         fetch("/api/folders", { credentials: "include" }),
+        fetch("/api/user/storage", { credentials: "include" }),
       ]);
       if (filesRes.ok) setFiles(await filesRes.json() as FileMeta[]);
       if (foldersRes.ok) setFolders(await foldersRes.json() as FolderMeta[]);
+      if (storageRes.ok) setStorageStats(await storageRes.json() as StorageStats);
     } catch { /* ignore */ } finally {
       setLoading(false);
     }
@@ -121,6 +199,8 @@ export default function FileListPage() {
 
   return (
     <div className="space-y-6 max-w-5xl mx-auto">
+      {!currentFolderId && <StoragePanel stats={storageStats} />}
+
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           {currentFolderId && (

@@ -111,6 +111,11 @@ router.post("/auth/logout", (req, res): void => {
   });
 });
 
+function checkIsAdmin(userId: string): boolean {
+  const raw = process.env["ADMIN_USER_IDS"] ?? "";
+  return raw.split(",").map((s) => s.trim()).filter(Boolean).includes(userId);
+}
+
 router.get("/auth/me", async (req, res): Promise<void> => {
   const userId = req.session.userId;
   if (!userId) {
@@ -123,7 +128,7 @@ router.get("/auth/me", async (req, res): Promise<void> => {
     res.status(401).json({ error: "Not authenticated" });
     return;
   }
-  res.json({ id: user.id, username: user.username });
+  res.json({ id: user.id, username: user.username, isAdmin: checkIsAdmin(user.id) });
 });
 
 export default router;

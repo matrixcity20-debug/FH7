@@ -33,7 +33,11 @@ export function attachSignalingServer(httpServer: Server) {
     const ip = req.socket.remoteAddress ?? "unknown";
     const connCount = ipConnCount.get(ip) ?? 0;
     if (connCount >= MAX_CONN_PER_IP) {
-      logger.warn({ ip }, "WS connection rejected: too many connections from IP");
+      // Log a hashed IP (first 8 hex chars of SHA-256) — enough to correlate
+      // events without storing raw IP addresses in logs (GDPR Art. 5(1)(c)).
+      const { createHash } = await import("crypto");
+      const ipHash = createHash("sha256").update(ip).digest("hex").slice(0, 8);
+      logger.warn({ ipHash }, "WS connection rejected: too many connections from IP");
       ws.close(1008, "Too many connections from this IP");
       return;
     }

@@ -79,9 +79,21 @@ export function isValidFolderId(folderId: string): boolean {
   return FOLDER_ID_PATTERN.test(folderId);
 }
 
+export function safeFolderMetaPath(folderId: string): string {
+  if (!isValidFolderId(folderId)) {
+    throw new Error(`Invalid folderId: "${folderId}"`);
+  }
+  const resolved = path.resolve(getFoldersDir(), `${folderId}.json`);
+  const root = path.resolve(getFoldersDir());
+  if (!resolved.startsWith(root + path.sep) && resolved !== root) {
+    throw new Error(`Invalid folderId: "${folderId}"`);
+  }
+  return resolved;
+}
+
 export function saveFolderMeta(folder: FolderMeta): void {
   ensureFoldersDir();
-  fs.writeFileSync(getFolderMetaPath(folder.id), JSON.stringify(folder, null, 2));
+  fs.writeFileSync(safeFolderMetaPath(folder.id), JSON.stringify(folder, null, 2));
 }
 
 export function readFolderMeta(folderId: string): FolderMeta | null {

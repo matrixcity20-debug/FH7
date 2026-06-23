@@ -10,6 +10,8 @@ import { toast } from "@/hooks/use-toast";
 
 import { hashFileStreaming } from "@/lib/sha256";
 
+const DEFAULT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024; // 500 MB fallback
+
 const TTL_OPTIONS = [
   { value: "", label: "Hiç dolmasın" },
   { value: "1h", label: "1 saat" },
@@ -51,6 +53,10 @@ type UploadStep =
   | { phase: "uploading"; done: number; total: number }
   | { phase: "finalizing" };
 
+interface UserStorageLimits {
+  maxFileSizeBytes: number;
+}
+
 export default function UploadPage() {
   const [, setLocation] = useLocation();
 
@@ -64,6 +70,7 @@ export default function UploadPage() {
   const [versionLookupLoading, setVersionLookupLoading] = useState(false);
   const [folders, setFolders] = useState<FolderMeta[]>([]);
   const [selectedFolderId, setSelectedFolderId] = useState<string>("");
+  const [userLimits, setUserLimits] = useState<UserStorageLimits>({ maxFileSizeBytes: DEFAULT_MAX_FILE_SIZE_BYTES });
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef(false);
 
@@ -72,6 +79,10 @@ export default function UploadPage() {
       .then((r) => r.ok ? r.json() as Promise<FolderMeta[]> : [])
       .then(setFolders)
       .catch(() => setFolders([]));
+    fetch("/api/user/storage", { credentials: "include" })
+      .then((r) => r.ok ? r.json() as Promise<UserStorageLimits> : null)
+      .then((data) => { if (data?.maxFileSizeBytes) setUserLimits(data); })
+      .catch(() => {});
   }, []);
 
   const extractFileId = (input: string): string | null => {
@@ -129,12 +140,24 @@ export default function UploadPage() {
     else if (e.type === "dragleave") setDragActive(false);
   }, []);
 
+  const validateAndSetFile = useCallback((f: File) => {
+    if (f.size > userLimits.maxFileSizeBytes) {
+      toast({
+        variant: "destructive",
+        title: "Dosya boyutu limitini geçiyor!",
+        description: `Dosyanızın boyutu (${formatBytes(f.size)}) izin verilen maksimum sınırı (${formatBytes(userLimits.maxFileSizeBytes)}) aşıyor. Lütfen daha küçük bir dosya seçin.`,
+      });
+      return;
+    }
+    setFile(f);
+  }, [userLimits]);
+
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-    if (e.dataTransfer.files?.[0]) setFile(e.dataTransfer.files[0]);
-  }, []);
+    if (e.dataTransfer.files?.[0]) validateAndSetFile(e.dataTransfer.files[0]);
+  }, [validateAndSetFile]);
 
   const isUploading = uploadStep.phase !== "idle";
 
@@ -247,7 +270,7 @@ export default function UploadPage() {
         onDragEnter={handleDrag} onDragLeave={handleDrag} onDragOver={handleDrag} onDrop={handleDrop}
         onClick={() => !isUploading && !file && inputRef.current?.click()}
       >
-        <input type="file" ref={inputRef} className="hidden" onChange={(e) => { if (e.target.files?.[0]) setFile(e.target.files[0]); }} disabled={isUploading} />
+        <input type="file" ref={inputRef} className="hidden" onChange={(e) => { if (e.target.files?.[0]) validateAndSetFile(e.target.files[0]); e.target.value = ""; }} disabled={isUploading} />
 
         <div className="p-14 text-center">
           {isUploading ? (
@@ -346,7 +369,7 @@ export default function UploadPage() {
 
       <div className="flex items-center gap-2 text-xs text-muted-foreground justify-center font-mono">
         <AlertCircle className="w-3.5 h-3.5" />
-        <span>Maks dosya boyutu: 500 MB · Parça boyutu: 1 MB</span>
+        <span>Maks dosya boyutu: {formatBytes(userLimits.maxFileSizeBytes)} · Parça boyutu: 1 MB</span>
       </div>
 
       <div className="grid grid-cols-3 gap-3">

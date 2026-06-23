@@ -57,16 +57,18 @@ async function main(): Promise<void> {
 
   for (const user of localUsers) {
     const result = await migrateUserToFirebase(user);
+    // Redact username from logs — show only last 4 chars of UUID for correlation.
+    const shortId = user.id.slice(-4);
     if (result === "migrated") {
       migrated++;
-      console.log(`  ✓ taşındı: ${user.username} (${user.id})`);
+      console.log(`  ✓ taşındı: [kullanıcı …${shortId}]`);
     } else if (result === "already-migrated") {
       alreadyMigrated++;
-      console.log(`  · zaten taşınmış: ${user.username} (${user.id}) — atlandı`);
+      console.log(`  · zaten taşınmış: [kullanıcı …${shortId}] — atlandı`);
     } else if (result === "conflict") {
       skipped++;
-      conflicts.push(user.username);
-      console.warn(`  ⚠ ÇAKIŞMA: "${user.username}" zaten Firebase'de farklı bir hesap olarak kayıtlı — ATLANDI`);
+      conflicts.push(shortId);
+      console.warn(`  ⚠ ÇAKIŞMA: [kullanıcı …${shortId}] zaten Firebase'de farklı bir hesap olarak kayıtlı — ATLANDI`);
     }
   }
 
@@ -76,7 +78,7 @@ async function main(): Promise<void> {
   console.log(`Çakışma (atlanan): ${skipped}/${localUsers.length}`);
 
   if (conflicts.length > 0) {
-    console.log(`\nÇakışan kullanıcı adları: ${conflicts.join(", ")}`);
+    console.log(`\nÇakışan kullanıcı kısa ID'leri: ${conflicts.join(", ")}`);
     console.log(
       "Bu kullanıcı adları hem yerel depoda hem Firebase'de birbirinden BAĞIMSIZ hesaplar olarak var.\n" +
         "Hangisinin gerçek/öncelikli hesap olduğuna manuel karar verip uygun tarafı elle birleştirin\n" +

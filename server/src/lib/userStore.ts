@@ -2,16 +2,34 @@ import fs from "fs";
 import path from "path";
 import { createHash } from "crypto";
 import { v4 as uuidv4 } from "uuid";
-import { uploadsDir, ensureUploadsDir } from "./fileStore.js";
+import { uploadsDir, ensureUploadsDir, MAX_USER_STORAGE_BYTES, MAX_FILE_SIZE, CHUNK_SIZE } from "./fileStore.js";
 import { getFirebaseDb } from "./firebase.js";
 import { logger } from "./logger.js";
+
+// Per-user limit overrides. Undefined/absent fields fall back to server defaults.
+export interface UserLimits {
+  storageQuotaBytes?: number;
+  maxFileSizeBytes?: number;
+  chunkSizeBytes?: number;
+}
+
+// Effective (resolved) limits after merging user overrides with server defaults.
+export interface ResolvedLimits {
+  storageQuotaBytes: number;
+  maxFileSizeBytes: number;
+  chunkSizeBytes: number;
+}
 
 export interface User {
   id: string;
   username: string;
   passwordHash: string;
   createdAt: string;
+  limits?: UserLimits;
 }
+
+// Public user shape exposed to admin endpoints — never includes passwordHash.
+export type PublicUser = Omit<User, "passwordHash">;
 
 /**
  * Kullanıcı deposu — iki backend destekler:
@@ -247,4 +265,119 @@ export async function usernameExists(username: string): Promise<boolean> {
     return (await findUserByUsernameFirebase(username)) !== null;
   }
   return findUserByUsernameLocal(username) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Per-user limit management
+// ---------------------------------------------------------------------------
+
+function resolveDefaults(limits?: UserLimits): ResolvedLimits {
+  return {
+    storageQuotaBytes: limits?.storageQuotaBytes ?? MAX_USER_STORAGE_BYTES,
+    maxFileSizeBytes:  limits?.maxFileSizeBytes  ?? MAX_FILE_SIZE,
+    chunkSizeBytes:    limits?.chunkSizeBytes    ?? CHUNK_SIZE,
+  };
+}
+
+// Local: update the limits field of a user in _users.json
+function setLimitsLocal(userId: string, limits: UserLimits): void {
+  const p = getUsersFilePath();
+  const users = loadLocalUsers();
+  const idx = users.findIndex((u) => u.id === userId);
+  if (idx === -1) return;
+  users[idx] = { ...users[idx]!, limits };
+  fs.writeFileSync(p, JSON.stringify(users, null, 2));
+}
+
+// Firebase: update only the limits sub-key to avoid overwriting other fields
+async function setLimitsFirebase(userId: string, limits: UserLimits): Promise<void> {
+  const db = getFirebaseDb();
+  if (!db) throw new Error("FIREBASE_NOT_CONFIGURED");
+  await db.ref(`users/${userId}/limits`).set(limits);
+}
+
+// Local: list all users without passwordHash
+function listAllUsersPublicLocal(): PublicUser[] {
+  return loadLocalUsers().map(({ passwordHash: _, ...rest }) => rest);
+}
+
+// Firebase: list all users without passwordHash
+async function listAllUsersPublicFirebase(): Promise<PublicUser[]> {
+  const db = getFirebaseDb();
+  if (!db) return [];
+  const snap = await db.ref("users").get();
+  if (!snap.exists()) return [];
+  const users: PublicUser[] = [];
+  snap.forEach((child) => {
+    const u = child.val() as User;
+    const { passwordHash: _, ...rest } = u;
+    users.push(rest);
+  });
+  return users;
+}
+
+/**
+ * Returns the resolved (effective) limits for a user, merging any per-user
+ * overrides stored in the database with the server-wide defaults.
+ */
+export async function getUserLimits(userId: string): Promise<ResolvedLimits> {
+  const user = await findUserById(userId);
+  return resolveDefaults(user?.limits);
+}
+
+/**
+ * Persists per-user limit overrides. Pass undefined for any field to clear
+ * that override (the field will be omitted and the server default applies).
+ * Admin-only — the caller MUST have already verified admin access.
+ */
+export async function setUserLimits(userId: string, limits: UserLimits): Promise<void> {
+  // Strip undefined/null values so they don't persist as explicit nulls
+  const cleaned: UserLimits = {};
+  if (limits.storageQuotaBytes !== undefined && limits.storageQuotaBytes !== null)
+    cleaned.storageQuotaBytes = limits.storageQuotaBytes;
+  if (limits.maxFileSizeBytes !== undefined && limits.maxFileSizeBytes !== null)
+    cleaned.maxFileSizeBytes = limits.maxFileSizeBytes;
+  if (limits.chunkSizeBytes !== undefined && limits.chunkSizeBytes !== null)
+    cleaned.chunkSizeBytes = limits.chunkSizeBytes;
+
+  if (getFirebaseDb()) {
+    try {
+      await setLimitsFirebase(userId, cleaned);
+      return;
+    } catch (err) {
+      logger.error({ err }, "Firebase setLimits error, falling back to local");
+    }
+  }
+  setLimitsLocal(userId, cleaned);
+}
+
+/**
+ * Removes all per-user limit overrides; the user reverts to server defaults.
+ * Admin-only — the caller MUST have already verified admin access.
+ */
+export async function resetUserLimits(userId: string): Promise<void> {
+  if (getFirebaseDb()) {
+    try {
+      const db = getFirebaseDb()!;
+      await db.ref(`users/${userId}/limits`).remove();
+      return;
+    } catch (err) {
+      logger.error({ err }, "Firebase resetLimits error, falling back to local");
+    }
+  }
+  setLimitsLocal(userId, {});
+}
+
+/**
+ * Returns all users without their passwordHash — used by admin endpoints only.
+ */
+export async function listAllUsersPublic(): Promise<PublicUser[]> {
+  if (getFirebaseDb()) {
+    try {
+      return await listAllUsersPublicFirebase();
+    } catch (err) {
+      logger.error({ err }, "Firebase listAllUsers error, falling back to local");
+    }
+  }
+  return listAllUsersPublicLocal();
 }

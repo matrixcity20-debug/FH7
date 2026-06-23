@@ -8,6 +8,7 @@ import FileListPage from "@/pages/file-list";
 import FileDetailPage from "@/pages/file-detail";
 import LoginPage from "@/pages/login";
 import RegisterPage from "@/pages/register";
+import AdminPage from "@/pages/admin";
 import NotFound from "@/pages/not-found";
 
 const queryClient = new QueryClient({
@@ -70,6 +71,7 @@ function Router() {
       <Route path="/" component={() => <ProtectedRoute component={UploadPage} />} />
       <Route path="/files" component={() => <ProtectedRoute component={FileListPage} />} />
       <Route path="/files/:fileId" component={() => <PublicRoute component={FileDetailPage} />} />
+      <Route path="/admin" component={() => <ProtectedRoute component={AdminPage} />} />
       <Route component={NotFound} />
     </Switch>
   );

@@ -38,6 +38,7 @@ import {
   isValidFolderId,
   type FolderMeta,
 } from "../lib/fileStore.js";
+import { getUserLimits } from "../lib/userStore.js";
 
 const router: IRouter = Router();
 
@@ -92,10 +93,11 @@ function sanitizeMimeType(raw: string): string {
 // declared max size (disk-exhaustion DoS guard), and creation time (TTL-based
 // cleanup of abandoned uploads that never reached finalize).
 interface UploadSession {
-  sessionId: string;     // req.sessionID that called upload-init
-  maxBytes: number;      // client-declared file size — upper bound for received bytes
-  receivedBytes: number; // running total of bytes written to disk across all parts
-  createdAt: number;     // Date.now() at upload-init time — for TTL cleanup
+  sessionId: string;           // req.sessionID that called upload-init
+  maxBytes: number;            // client-declared file size — upper bound for received bytes
+  receivedBytes: number;       // running total of bytes written to disk across all parts
+  createdAt: number;           // Date.now() at upload-init time — for TTL cleanup
+  userMaxFileSizeBytes: number; // per-user resolved maxFileSizeBytes — for part-level DoS guard
 }
 const uploadSessions = new Map<string, UploadSession>();
 
@@ -210,23 +212,40 @@ function getBaseUrl(req: Request): string {
   return `${protocol}://${host}`;
 }
 
-// BUL-08: shared per-user storage quota check, used by all endpoints that
-// persist file bytes to disk.
-function checkUserQuota(
+// BUL-08: shared per-user storage quota check — now async to read per-user
+// storage quota overrides from the database.
+async function checkUserQuota(
   userId: string,
   incomingBytes: number,
-): { ok: true } | { ok: false; message: string } {
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const { storageQuotaBytes } = await getUserLimits(userId);
   const used = getUserStorageUsed(userId);
-  if (used + incomingBytes <= MAX_USER_STORAGE_BYTES) {
+  if (used + incomingBytes <= storageQuotaBytes) {
     return { ok: true };
   }
   const usedMb = (used / 1024 / 1024).toFixed(1);
-  const limitMb = Math.round(MAX_USER_STORAGE_BYTES / 1024 / 1024);
+  const limitMb = Math.round(storageQuotaBytes / 1024 / 1024);
   return {
     ok: false,
     message: `Depolama kotanız doldu (${usedMb} MB / ${limitMb} MB kullanılıyor). Devam etmek için bazı dosyaları silin.`,
   };
 }
+
+// ── Storage stats — authenticated, returns per-user resolved limits + usage ──
+router.get("/user/storage", requireAuth, async (req, res): Promise<void> => {
+  const userId = req.session.userId as string;
+  const [userLimits, usedBytes] = await Promise.all([
+    getUserLimits(userId),
+    Promise.resolve(getUserStorageUsed(userId)),
+  ]);
+  res.json({
+    usedBytes,
+    totalBytes: userLimits.storageQuotaBytes,
+    freeBytes: Math.max(0, userLimits.storageQuotaBytes - usedBytes),
+    maxFileSizeBytes: userLimits.maxFileSizeBytes,
+    chunkSizeBytes: userLimits.chunkSizeBytes,
+  });
+});
 
 router.get("/folders", requireAuth, async (req, res): Promise<void> => {
   const folders = listFolders(req.session.userId);
@@ -343,7 +362,7 @@ router.post(
     // BUL-08: enforce per-user storage quota using the real, measured upload
     // size (req.file.size comes from multer after the bytes are on disk, not
     // a client-supplied claim).
-    const quota = checkUserQuota(req.session.userId as string, req.file.size);
+    const quota = await checkUserQuota(req.session.userId as string, req.file.size);
     if (!quota.ok) {
       try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
       res.status(413).json({ error: quota.message });
@@ -408,8 +427,12 @@ router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): 
     res.status(400).json({ error: "Geçersiz dosya adı" });
     return;
   }
-  if (typeof size !== "number" || size <= 0 || size > MAX_FILE_SIZE) {
-    res.status(400).json({ error: `Dosya çok büyük (maks ${MAX_FILE_SIZE / 1024 / 1024} MB)` });
+  // Resolve per-user limits before size checks so the error message is accurate.
+  const userLimits = await getUserLimits(req.session.userId as string);
+  if (typeof size !== "number" || size <= 0 || size > userLimits.maxFileSizeBytes) {
+    res.status(400).json({
+      error: `Dosya boyutunuz limitinizi geçiyor! (maks ${(userLimits.maxFileSizeBytes / 1024 / 1024).toFixed(0)} MB)`,
+    });
     return;
   }
   if (!mimeType || typeof mimeType !== "string") {
@@ -421,7 +444,7 @@ router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): 
   // obviously-over-quota upload is rejected before the user spends time
   // uploading parts. The authoritative check happens again at finalize time
   // using the real, server-measured size.
-  const earlyQuota = checkUserQuota(req.session.userId as string, size);
+  const earlyQuota = await checkUserQuota(req.session.userId as string, size);
   if (!earlyQuota.ok) {
     res.status(413).json({ error: earlyQuota.message });
     return;
@@ -439,6 +462,7 @@ router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): 
     maxBytes: size,
     receivedBytes: 0,
     createdAt: Date.now(),
+    userMaxFileSizeBytes: userLimits.maxFileSizeBytes,
   });
 
   req.log.info({ uploadId, name, size }, "Upload session initialised");
@@ -503,7 +527,7 @@ router.post(
       return;
     }
     rec.receivedBytes += req.file.size;
-    const ceiling = Math.min(rec.maxBytes * 1.01 + 1024, MAX_FILE_SIZE);
+    const ceiling = Math.min(rec.maxBytes * 1.01 + 1024, rec.userMaxFileSizeBytes);
     if (rec.receivedBytes > ceiling) {
       try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       uploadSessions.delete(uploadId);
@@ -586,7 +610,7 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     // (not the client-declared `size`), now that the file is fully assembled
     // on disk. The early check in upload-init only catches the obvious case;
     // this is what actually enforces the limit.
-    const finalQuota = checkUserQuota(req.session.userId as string, measuredBytes);
+    const finalQuota = await checkUserQuota(req.session.userId as string, measuredBytes);
     if (!finalQuota.ok) {
       deleteFile(fileId);
       res.status(413).json({ error: finalQuota.message });

@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { Layers, HardDrive, LogOut, User } from "lucide-react";
+import { Layers, HardDrive, LogOut, User, Shield } from "lucide-react";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "@/hooks/use-toast";
 
@@ -46,6 +46,18 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                   Kütüphane
                 </button>
               </Link>
+              {user?.isAdmin && (
+                <Link href="/admin">
+                  <button
+                    className={`px-3 py-1.5 rounded-lg text-xs font-mono transition-colors flex items-center gap-1.5 ${
+                      location.startsWith("/admin") ? "bg-primary/10 text-primary border border-primary/20" : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
+                    }`}
+                  >
+                    <Shield className="w-3 h-3" />
+                    Admin
+                  </button>
+                </Link>
+              )}
             </nav>
 
             {user && (
