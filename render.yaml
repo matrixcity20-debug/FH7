@@ -23,6 +23,16 @@ services:
         sync: false
       - key: FIREBASE_DATABASE_URL
         sync: false
+      # ── Upload limits (optional — defaults shown) ──────────────────────────
+      # Non-numeric values silently fall back to the defaults listed below.
+      - key: MAX_FILE_SIZE_MB
+        value: "500"
+      - key: CHUNK_SIZE_MB
+        value: "1"
+      - key: MAX_USER_STORAGE_MB
+        value: "5000"
+      - key: LOG_LEVEL
+        value: "info"
     disk:
       name: uploads
       mountPath: /uploads
