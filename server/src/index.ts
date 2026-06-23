@@ -2,7 +2,7 @@ import "./lib/env.js";
 import { createServer } from "http";
 import app from "./app.js";
 import { logger } from "./lib/logger.js";
-import { purgeExpiredFiles } from "./lib/fileStore.js";
+import { purgeExpiredFiles, purgeStaleUploadDirs } from "./lib/fileStore.js";
 import { attachSignalingServer } from "./lib/signaling.js";
 
 const rawPort = process.env["PORT"];
@@ -37,6 +37,8 @@ setInterval(
   () => {
     const count = purgeExpiredFiles();
     if (count > 0) logger.info({ count }, "Purged expired files");
+    const stale = purgeStaleUploadDirs();
+    if (stale > 0) logger.info({ stale }, "Purged stale upload temp dirs");
   },
   60 * 60 * 1000,
 );

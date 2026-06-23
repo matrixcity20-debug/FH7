@@ -28,7 +28,6 @@ interface FileMeta {
   expiresAt?: string;
   folderId?: string;
   version?: number;
-  seedOnly?: boolean;
 }
 
 interface FolderMeta {

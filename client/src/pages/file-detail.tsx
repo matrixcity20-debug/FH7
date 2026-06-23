@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { useParams, useLocation } from "wouter";
 import {
   Copy, Download, Trash2, Terminal, ArrowLeft, Layers,
-  FileCode2, Check, Link2, Clock, Radio, WifiOff, Loader2, GitBranch, Plus,
+  FileCode2, Check, Link2, Clock, Loader2, GitBranch, Plus,
   Lock, Eye, EyeOff, Shield, LogIn, KeyRound,
 } from "lucide-react";
 import { format, formatDistanceToNow } from "date-fns";
@@ -15,8 +15,6 @@ import { Switch } from "@/components/ui/switch";
 import { toast } from "@/hooks/use-toast";
 import { Link } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
-import { SHA256Stream } from "@/lib/sha256";
-import { getIceServers } from "@/lib/iceServers";
 
 interface FileMeta {
   id: string;
@@ -27,7 +25,6 @@ interface FileMeta {
   chunkSize: number;
   uploadedAt: string;
   expiresAt?: string;
-  seedOnly?: boolean;
   sha256?: string;
   groupId?: string;
   version?: number;
@@ -64,251 +61,6 @@ function MetaRow({ label, value, className }: { label: string; value: React.Reac
     <div className="flex items-start justify-between gap-4 py-2.5 border-b border-border/40 last:border-0">
       <span className="text-xs text-muted-foreground font-mono uppercase tracking-wider shrink-0">{label}</span>
       <span className={`text-xs font-mono text-right ${className ?? "text-foreground"}`}>{value}</span>
-    </div>
-  );
-}
-
-type P2PStatus = "idle" | "connecting" | "receiving" | "done" | "error" | "offline";
-type SeederPresence = "checking" | "online" | "offline" | "unknown";
-
-const CONNECT_TIMEOUT_MS = 30_000;
-
-function P2PDownloader({ fileId, fileName, fileSize, mimeType }: { fileId: string; fileName: string; fileSize: number; mimeType: string }) {
-  const [status, setStatus] = useState<P2PStatus>("idle");
-  const [progress, setProgress] = useState(0);
-  const [errorMsg, setErrorMsg] = useState("");
-  const [presence, setPresence] = useState<SeederPresence>("checking");
-  const wsRef = useRef<WebSocket | null>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  // BUG-01 fix: queue ICE candidates that arrive before setRemoteDescription completes
-  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const remoteReadyRef = useRef(false);
-  // BUG-06 fix: connection timeout handle
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // BUG-I fix: auto-reconnect on ICE failure — cap at MAX_RETRIES to avoid infinite loop
-  const retryCountRef = useRef(0);
-  const MAX_RETRIES = 3;
-
-  useEffect(() => {
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
-    ws.onopen = () => ws.send(JSON.stringify({ type: "seeder-status", fileId }));
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data as string) as Record<string, unknown>;
-      if (msg.type === "seeder-status" && msg.fileId === fileId) {
-        setPresence(msg.online ? "online" : "offline");
-        ws.close();
-      }
-    };
-    ws.onerror = () => setPresence("unknown");
-    const timeout = setTimeout(() => { setPresence((prev) => prev === "checking" ? "unknown" : prev); ws.close(); }, 5000);
-    return () => { clearTimeout(timeout); ws.close(); };
-  }, [fileId]);
-
-  useEffect(() => {
-    return () => {
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-      wsRef.current?.close();
-      pcRef.current?.close();
-    };
-  }, []);
-
-  const cancelDownload = () => {
-    if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
-    wsRef.current?.close();
-    pcRef.current?.close();
-    pcRef.current = null;
-    pendingCandidatesRef.current = [];
-    remoteReadyRef.current = false;
-    setStatus("idle");
-    setErrorMsg("");
-  };
-
-  const startDownload = (isRetry = false) => {
-    if (!isRetry) retryCountRef.current = 0;
-    setStatus("connecting"); setProgress(0); setErrorMsg("");
-    pendingCandidatesRef.current = [];
-    remoteReadyRef.current = false;
-
-    // BUG-06 fix: abort after CONNECT_TIMEOUT_MS if seeder never completes handshake
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => {
-      wsRef.current?.close();
-      pcRef.current?.close();
-      pcRef.current = null;
-      pendingCandidatesRef.current = [];
-      remoteReadyRef.current = false;
-      setStatus("error");
-      setErrorMsg(`Bağlantı zaman aşımı (${CONNECT_TIMEOUT_MS / 1000}s). Seeder yanıt vermedi.`);
-    }, CONNECT_TIMEOUT_MS);
-
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
-    wsRef.current = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ type: "leech", fileId }));
-    ws.onmessage = async (event) => {
-      const msg = JSON.parse(event.data as string) as Record<string, unknown>;
-
-      if (msg.type === "seeder-offline") {
-        if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
-        setStatus("offline");
-        setErrorMsg("Seeder çevrimdışı. Dosya sahibinin tarayıcısı açık değil.");
-        ws.close();
-        return;
-      }
-
-      if (msg.type === "offer") {
-        const iceServers = await getIceServers();
-        const pc = new RTCPeerConnection({ iceServers });
-        pcRef.current = pc;
-        pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: "ice", to: msg.from, candidate: e.candidate })); };
-
-        // BUG-I fix: auto-reconnect on ICE failure (up to MAX_RETRIES times)
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === "failed") {
-            ws.close();
-            pc.close();
-            if (retryCountRef.current < MAX_RETRIES) {
-              retryCountRef.current++;
-              setErrorMsg(`Bağlantı kesildi — yeniden deneniyor (${retryCountRef.current}/${MAX_RETRIES})…`);
-              setTimeout(() => startDownload(true), 2_000);
-            } else {
-              setStatus("error");
-              setErrorMsg(`ICE bağlantısı başarısız oldu. ${MAX_RETRIES} otomatik deneme tükendi.`);
-            }
-          }
-        };
-
-        const receivedChunks: ArrayBuffer[] = [];
-        let headerParsed = false, totalChunks = 0, expectedSha256 = "";
-
-        pc.ondatachannel = (e) => {
-          const dc = e.channel;
-          // BUG-09 fix: ensure binary messages arrive as ArrayBuffer, not Blob
-          dc.binaryType = "arraybuffer";
-          setStatus("receiving");
-          if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
-          dc.onmessage = (ev) => {
-            if (!headerParsed) {
-              // BUG-E fix: read expected sha256 from seeder header for integrity check
-              const h = JSON.parse(ev.data as string) as { chunkCount: number; sha256?: string };
-              totalChunks = h.chunkCount;
-              expectedSha256 = h.sha256 ?? "";
-              headerParsed = true;
-              return;
-            }
-            if (ev.data === "__DONE__") {
-              // BUG-E fix: verify SHA-256 of received data before triggering download
-              const finalize = () => {
-                if (expectedSha256) {
-                  const sha = new SHA256Stream();
-                  for (const chunk of receivedChunks) {
-                    sha.update(new Uint8Array(chunk));
-                  }
-                  const actualHash = sha.digest();
-                  if (actualHash !== expectedSha256) {
-                    setStatus("error");
-                    setErrorMsg("Bütünlük kontrolü başarısız — alınan veri bozulmuş veya değiştirilmiş olabilir.");
-                    ws.close();
-                    return;
-                  }
-                }
-                const blob = new Blob(receivedChunks, { type: mimeType });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a"); a.href = url; a.download = fileName;
-                document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-                setStatus("done"); setProgress(100); ws.close();
-              };
-              finalize();
-              return;
-            }
-            receivedChunks.push(ev.data as ArrayBuffer);
-            if (totalChunks > 0) setProgress(Math.round((receivedChunks.length / totalChunks) * 100));
-          };
-        };
-
-        // BUG-01 fix: set remote first, then flush any queued ICE candidates
-        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
-        remoteReadyRef.current = true;
-        for (const c of pendingCandidatesRef.current) {
-          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { /* ignore */ }
-        }
-        pendingCandidatesRef.current = [];
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: "answer", to: msg.from, sdp: pc.localDescription }));
-      }
-
-      if (msg.type === "ice") {
-        // BUG-01 fix: queue if remote description isn't set yet; add immediately otherwise
-        if (remoteReadyRef.current && pcRef.current) {
-          try { await pcRef.current.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit)); } catch { /* ignore */ }
-        } else {
-          pendingCandidatesRef.current.push(msg.candidate as RTCIceCandidateInit);
-        }
-      }
-    };
-    ws.onerror = () => {
-      if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
-      setStatus("error");
-      setErrorMsg("WebSocket bağlantısı başarısız.");
-    };
-  };
-
-  return (
-    <div className="space-y-4">
-      {status === "idle" && (
-        <div className="space-y-3">
-          <div className="flex items-center gap-2 p-3 rounded-lg border border-primary/20 bg-primary/5">
-            <Radio className="w-4 h-4 text-primary shrink-0" />
-            <p className="text-xs text-muted-foreground font-mono">Bu dosya P2P olarak paylaşılıyor. İndirme doğrudan sahibin tarayıcısından akar.</p>
-          </div>
-          <div className="flex items-center gap-1.5 text-xs font-mono">
-            {presence === "checking" && <span className="flex items-center gap-1.5 text-muted-foreground"><Loader2 className="w-3 h-3 animate-spin" /> Seeder durumu kontrol ediliyor…</span>}
-            {presence === "online" && <span className="flex items-center gap-1.5 text-emerald-400"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> Seeder çevrimiçi</span>}
-            {presence === "offline" && <span className="flex items-center gap-1.5 text-amber-400"><WifiOff className="w-3 h-3" /> Seeder çevrimdışı görünüyor</span>}
-          </div>
-          <Button className="w-full gap-2 text-xs font-mono" onClick={startDownload}>
-            <Download className="w-3.5 h-3.5" /> P2P ile İndir
-          </Button>
-        </div>
-      )}
-      {status === "connecting" && (
-        <div className="flex flex-col items-center gap-3 py-4">
-          <Loader2 className="w-8 h-8 text-primary animate-spin" />
-          <p className="text-xs font-mono text-muted-foreground">Seeder'a bağlanılıyor…</p>
-          {/* BUG-06 fix: cancel button so the UI never stays frozen */}
-          <Button variant="ghost" size="sm" className="text-xs font-mono text-muted-foreground" onClick={cancelDownload}>
-            İptal
-          </Button>
-        </div>
-      )}
-      {status === "receiving" && (
-        <div className="space-y-3">
-          <div className="flex justify-between text-xs font-mono text-muted-foreground">
-            <span className="flex items-center gap-1"><Radio className="w-3.5 h-3.5 text-primary animate-pulse" /> Peer'dan alınıyor...</span>
-            <span className="text-primary">{progress}%</span>
-          </div>
-          <Progress value={progress} className="h-1.5" />
-        </div>
-      )}
-      {status === "done" && (
-        <div className="flex flex-col items-center gap-2 py-3">
-          <Check className="w-8 h-8 text-emerald-400" />
-          <p className="text-xs font-mono text-emerald-400">İndirme tamamlandı!</p>
-          <Button variant="outline" size="sm" className="text-xs font-mono mt-1" onClick={() => setStatus("idle")}>Tekrar İndir</Button>
-        </div>
-      )}
-      {(status === "offline" || status === "error") && (
-        <div className="space-y-3">
-          <div className="flex items-center gap-2 p-3 rounded-lg border border-red-500/20 bg-red-500/5">
-            <WifiOff className="w-4 h-4 text-red-400 shrink-0" />
-            <p className="text-xs text-red-400/80 font-mono">{errorMsg}</p>
-          </div>
-          <Button variant="outline" className="w-full gap-2 text-xs font-mono" onClick={startDownload}>Tekrar Dene</Button>
-        </div>
-      )}
     </div>
   );
 }
@@ -401,7 +153,7 @@ export default function FileDetailPage() {
           setFile(meta);
           setSettingsRequireLogin(meta.requireLogin);
           setSettingsHasPassword(meta.hasPassword);
-          if (!meta.seedOnly && meta.isOwner) {
+          if (meta.isOwner) {
             fetch(`/api/files/${id}/snippet`, { credentials: "include" })
               .then((sr) => sr.ok ? sr.json() : null)
               .then((d) => setSnippet((d as { snippet?: string } | null)?.snippet ?? null))
@@ -595,7 +347,6 @@ export default function FileDetailPage() {
     );
   }
 
-  const isSeedOnly = !!file.seedOnly;
   const downloadUrl = `/api/files/${fileId}/download`;
   const directDownloadUrl = `${window.location.origin}${downloadUrl}`;
   const shareUrl = `${window.location.origin}/files/${fileId}`;
@@ -616,11 +367,6 @@ export default function FileDetailPage() {
               {file.version !== undefined && (
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-primary/30 bg-primary/10 text-primary text-[10px] font-mono shrink-0">
                   <GitBranch className="w-2.5 h-2.5" /> v{file.version}
-                </span>
-              )}
-              {isSeedOnly && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-primary/30 bg-primary/10 text-primary text-[10px] font-mono shrink-0">
-                  <Radio className="w-2.5 h-2.5" /> P2P Seed
                 </span>
               )}
             </div>
@@ -646,19 +392,15 @@ export default function FileDetailPage() {
             {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Link2 className="w-3.5 h-3.5" />}
             {copiedLink ? "Kopyalandı!" : "Sayfa Linki"}
           </Button>
-          {!isSeedOnly && (
-            <Button variant="outline" size="sm" className="gap-2 text-xs font-mono" onClick={() => copy(directDownloadUrl, "directLink")}>
-              {copiedDirectLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-              {copiedDirectLink ? "Kopyalandı!" : "Direkt Link"}
+          <Button variant="outline" size="sm" className="gap-2 text-xs font-mono" onClick={() => copy(directDownloadUrl, "directLink")}>
+            {copiedDirectLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+            {copiedDirectLink ? "Kopyalandı!" : "Direkt Link"}
+          </Button>
+          <a href={downloadUrl} download={file.name}>
+            <Button size="sm" variant="secondary" className="gap-2 text-xs font-mono">
+              <Download className="w-3.5 h-3.5" /> İndir
             </Button>
-          )}
-          {!isSeedOnly && (
-            <a href={downloadUrl} download={file.name}>
-              <Button size="sm" variant="secondary" className="gap-2 text-xs font-mono">
-                <Download className="w-3.5 h-3.5" /> İndir
-              </Button>
-            </a>
-          )}
+          </a>
           {file.isOwner && (
             <Button size="sm" variant="destructive" className="gap-2 text-xs font-mono" onClick={deleteFile}>
               <Trash2 className="w-3.5 h-3.5" /> Sil
@@ -669,21 +411,8 @@ export default function FileDetailPage() {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2 space-y-5">
-          {isSeedOnly ? (
-            <Card className="border-primary/20 bg-primary/5">
-              <CardHeader className="pb-3">
-                <CardTitle className="flex items-center gap-2 font-mono text-sm">
-                  <Radio className="w-4 h-4 text-primary" /> P2P İndirme
-                </CardTitle>
-                <CardDescription className="text-xs">Bu dosya P2P olarak paylaşılıyor. WebRTC üzerinden doğrudan yükleyenin tarayıcısından akar.</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <P2PDownloader fileId={fileId} fileName={file.name} fileSize={file.size} mimeType={file.mimeType || "application/octet-stream"} />
-              </CardContent>
-            </Card>
-          ) : (
-            <>
-              {file.isOwner && snippet && (
+          <>
+            {file.isOwner && snippet && (
                 <Card className="border-border/60 bg-card/60">
                   <CardHeader className="pb-3">
                     <CardTitle className="flex items-center gap-2 font-mono text-sm">
@@ -739,8 +468,7 @@ export default function FileDetailPage() {
                   </div>
                 </CardContent>
               </Card>
-            </>
-          )}
+          </>
         </div>
 
         <div className="space-y-5">
@@ -749,7 +477,7 @@ export default function FileDetailPage() {
               <CardTitle className="font-mono text-sm">Metadata</CardTitle>
             </CardHeader>
             <CardContent className="px-5">
-              <MetaRow label="Tür" value={isSeedOnly ? <span className="flex items-center gap-1 text-primary"><Radio className="w-3 h-3" /> P2P Seed</span> : "Sunucuda saklandı"} />
+              <MetaRow label="Tür" value="Sunucuda saklandı" />
               <MetaRow label="MIME" value={file.mimeType || "application/octet-stream"} />
               <MetaRow label="Boyut" value={formatBytes(file.size)} />
               <MetaRow label="Parça boyutu" value={formatBytes(file.chunkSize)} />
@@ -780,30 +508,28 @@ export default function FileDetailPage() {
             </CardContent>
           </Card>
 
-          {!isSeedOnly && (
-            <Card className="border-border/60 bg-card/60">
-              <CardHeader className="pb-3">
-                <CardTitle className="font-mono text-sm flex items-center gap-2">
-                  <Download className="w-3.5 h-3.5 text-primary" /> Direkt İndirme Linki
-                </CardTitle>
-                <CardDescription className="text-xs">Tıklandığı anda dosya indirmeye başlar. Başka bir siteye buton/&lt;a&gt; olarak gömmek için uygundur.</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div className="p-3 rounded-lg bg-muted/20 border border-border/40">
-                  <code className="text-xs font-mono text-muted-foreground break-all leading-relaxed">{directDownloadUrl}</code>
-                </div>
-                <Button className="w-full gap-2 text-xs font-mono" onClick={() => copy(directDownloadUrl, "directLink")}>
-                  {copiedDirectLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedDirectLink ? "Kopyalandı!" : "Direkt Linki Kopyala"}
+          <Card className="border-border/60 bg-card/60">
+            <CardHeader className="pb-3">
+              <CardTitle className="font-mono text-sm flex items-center gap-2">
+                <Download className="w-3.5 h-3.5 text-primary" /> Direkt İndirme Linki
+              </CardTitle>
+              <CardDescription className="text-xs">Tıklandığı anda dosya indirmeye başlar. Başka bir siteye buton/&lt;a&gt; olarak gömmek için uygundur.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="p-3 rounded-lg bg-muted/20 border border-border/40">
+                <code className="text-xs font-mono text-muted-foreground break-all leading-relaxed">{directDownloadUrl}</code>
+              </div>
+              <Button className="w-full gap-2 text-xs font-mono" onClick={() => copy(directDownloadUrl, "directLink")}>
+                {copiedDirectLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedDirectLink ? "Kopyalandı!" : "Direkt Linki Kopyala"}
+              </Button>
+              <a href={downloadUrl} download={file.name} className="block">
+                <Button variant="outline" className="w-full gap-2 text-xs font-mono">
+                  <Download className="w-3.5 h-3.5" /> Dosyayı İndir
                 </Button>
-                <a href={downloadUrl} download={file.name} className="block">
-                  <Button variant="outline" className="w-full gap-2 text-xs font-mono">
-                    <Download className="w-3.5 h-3.5" /> Dosyayı İndir
-                  </Button>
-                </a>
-              </CardContent>
-            </Card>
-          )}
+              </a>
+            </CardContent>
+          </Card>
 
           {file.isOwner && (
             <Card className="border-border/60 bg-card/60">

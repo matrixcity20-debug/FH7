@@ -23,7 +23,6 @@ import type {
   ErrorResponse,
   FileInfo,
   HealthStatus,
-  SeedInput,
   SnippetResponse
 } from './api.schemas';
 
@@ -194,76 +193,6 @@ export function useListFiles<TData = Awaited<ReturnType<typeof listFiles>>, TErr
 
 
 
-export const getRegisterSeedUrl = () => {
-
-
-
-
-  return `/api/files/register-seed`
-}
-
-/**
- * @summary Register a seed-only file (P2P)
- */
-export const registerSeed = async (seedInput: SeedInput, options?: RequestInit): Promise<FileInfo> => {
-
-  return customFetch<FileInfo>(getRegisterSeedUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    body: JSON.stringify(
-      seedInput,)
-  }
-);}
-
-
-
-
-export const getRegisterSeedMutationOptions = <TError = ErrorType<ErrorResponse>,
-    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof registerSeed>>, TError,{data: BodyType<SeedInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
-): UseMutationOptions<Awaited<ReturnType<typeof registerSeed>>, TError,{data: BodyType<SeedInput>}, TContext> => {
-
-const mutationKey = ['registerSeed'];
-const {mutation: mutationOptions, request: requestOptions} = options ?
-      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
-      options
-      : {...options, mutation: {...options.mutation, mutationKey}}
-      : {mutation: { mutationKey, }, request: undefined};
-
-
-
-
-      const mutationFn: MutationFunction<Awaited<ReturnType<typeof registerSeed>>, {data: BodyType<SeedInput>}> = (props) => {
-          const {data} = props ?? {};
-
-          return  registerSeed(data,requestOptions)
-        }
-
-
-
-
-
-
-  return  { mutationFn, ...mutationOptions }}
-
-    export type RegisterSeedMutationResult = NonNullable<Awaited<ReturnType<typeof registerSeed>>>
-    export type RegisterSeedMutationBody = BodyType<SeedInput>
-    export type RegisterSeedMutationError = ErrorType<ErrorResponse>
-
-    /**
- * @summary Register a seed-only file (P2P)
- */
-export const useRegisterSeed = <TError = ErrorType<ErrorResponse>,
-    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof registerSeed>>, TError,{data: BodyType<SeedInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
- ): UseMutationResult<
-        Awaited<ReturnType<typeof registerSeed>>,
-        TError,
-        {data: BodyType<SeedInput>},
-        TContext
-      > => {
-      return useMutation(getRegisterSeedMutationOptions(options));
-    }
 
 export const getGetFileUrl = (fileId: string,) => {
 

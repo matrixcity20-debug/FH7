@@ -21,7 +21,7 @@ app.set("trust proxy", 1);
 
 app.use(
   helmet({
-    // BUL-06: enable CSP with permissive policy (supports React, WebRTC, WebSocket)
+    // BUL-06: enable CSP (supports React, WebSocket)
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
@@ -79,7 +79,7 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 // BUL-02: shared session middleware (also used by WebSocket signaling server)

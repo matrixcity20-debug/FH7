@@ -72,7 +72,6 @@ const TTL_OPTIONS: Record<string, number> = {
 };
 
 const MAX_CHUNK_COUNT = 10_000;
-const MAX_SEED_SIZE = 50 * 1024 * 1024 * 1024;
 
 // ── SEC: MIME type allowlist ──────────────────────────────────────────────────
 // Client-supplied mimeType is stored and later served as Content-Type.
@@ -88,10 +87,30 @@ function sanitizeMimeType(raw: string): string {
   return BLOCKED_MIME_TYPES.has(lower) ? "application/octet-stream" : (lower || "application/octet-stream").slice(0, 128);
 }
 
-// ── SEC: per-upload session ownership ────────────────────────────────────────
-// Maps uploadId → sessionID; prevents a different session from injecting parts
-// into an in-progress upload it did not initiate (IDOR on chunked upload).
-const uploadSessions = new Map<string, string>();
+// ── SEC: per-upload session ownership & byte tracking ────────────────────────
+// Tracks in-progress chunked uploads: session ownership (IDOR prevention),
+// declared max size (disk-exhaustion DoS guard), and creation time (TTL-based
+// cleanup of abandoned uploads that never reached finalize).
+interface UploadSession {
+  sessionId: string;     // req.sessionID that called upload-init
+  maxBytes: number;      // client-declared file size — upper bound for received bytes
+  receivedBytes: number; // running total of bytes written to disk across all parts
+  createdAt: number;     // Date.now() at upload-init time — for TTL cleanup
+}
+const uploadSessions = new Map<string, UploadSession>();
+
+// Purge upload sessions (and their temp dirs) abandoned for more than 24 hours.
+const UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+function purgeStaleUploadSessions(): void {
+  const cutoff = Date.now() - UPLOAD_SESSION_TTL_MS;
+  for (const [uploadId, rec] of uploadSessions) {
+    if (rec.createdAt < cutoff) {
+      uploadSessions.delete(uploadId);
+      cleanupUpload(uploadId);
+    }
+  }
+}
 
 // Maximum number of file IDs kept in a session's unlockedFiles list
 const MAX_UNLOCKED_FILES = 200;
@@ -106,7 +125,7 @@ const uploadLimiter = rateLimit({
   keyGenerator: (req: Request) => (req.session as Record<string, unknown>)?.["userId"] as string ?? req.ip ?? "unknown",
 });
 
-// BUL-04: download rate limit — endpoint intentionally public for embed/P2P but rate-limited
+// BUL-04: download rate limit — endpoint intentionally public for embed/direct download but rate-limited
 const downloadLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 120,
@@ -163,13 +182,18 @@ function canAccess(
 }
 
 function buildPublicMeta(meta: FileMeta, req: Request) {
-  const { userId: _u, passwordHash: _p, ...rest } = meta;
+  // SEC: strip userId, passwordHash, and sha256 from the public shape.
+  // sha256 is only surfaced back to the owner — it is not needed by other
+  // downloaders and leaking it needlessly increases the attack surface for
+  // any future hash-based exploitation primitives.
+  const { userId: _u, passwordHash: _p, sha256: _hash, ...rest } = meta;
   const isOwner = !!req.session.userId && meta.userId === req.session.userId;
   return {
     ...rest,
     isOwner,
     requireLogin: !!meta.requireLogin,
     hasPassword: !!meta.passwordHash,
+    ...(isOwner && meta.sha256 ? { sha256: meta.sha256 } : {}),
   };
 }
 
@@ -187,8 +211,7 @@ function getBaseUrl(req: Request): string {
 }
 
 // BUL-08: shared per-user storage quota check, used by all endpoints that
-// persist file bytes to disk (register-seed is exempt — it stores no bytes,
-// only metadata for P2P seeding).
+// persist file bytes to disk.
 function checkUserQuota(
   userId: string,
   incomingBytes: number,
@@ -352,7 +375,7 @@ router.post(
       const meta: FileMeta = {
         id: fileId,
         userId: req.session.userId,
-        name: req.file.originalname,
+        name: (req.file.originalname ?? "").slice(0, 512) || "untitled",
         size: fileSize,
         mimeType: sanitizeMimeType(req.file.mimetype || "application/octet-stream"),
         chunkCount,
@@ -407,9 +430,16 @@ router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): 
   const uploadId = uuidv4();
   ensureUploadsDir();
   fs.mkdirSync(getUploadTempDir(uploadId), { recursive: true });
-  // SEC-IDOR: bind this uploadId to the current session so upload-part and
-  // upload-finalize can reject requests from a different session.
-  uploadSessions.set(uploadId, req.sessionID);
+  // SEC-IDOR: bind uploadId → session; includes maxBytes for disk-exhaustion guard
+  // and createdAt for TTL-based cleanup of abandoned uploads.
+  // Purge stale sessions first so the Map does not grow without bound.
+  purgeStaleUploadSessions();
+  uploadSessions.set(uploadId, {
+    sessionId: req.sessionID,
+    maxBytes: size,
+    receivedBytes: 0,
+    createdAt: Date.now(),
+  });
 
   req.log.info({ uploadId, name, size }, "Upload session initialised");
   res.status(201).json({ uploadId, partSize: UPLOAD_PART_SIZE });
@@ -422,10 +452,23 @@ const partUpload = multer({
       if (!uploadId || !isValidUploadId(uploadId)) { cb(new Error("Geçersiz uploadId"), ""); return; }
       const dir = getUploadTempDir(uploadId);
       if (!fs.existsSync(dir)) { cb(new Error("Bilinmeyen uploadId"), ""); return; }
+      // SEC-IDOR: enforce session ownership *before* writing bytes to disk so an
+      // attacker who guesses a UUID cannot inject parts into someone else's upload.
+      const rec = uploadSessions.get(uploadId);
+      if (!rec || rec.sessionId !== req.sessionID) {
+        cb(new Error("Bu yükleme oturumu size ait değil"), "");
+        return;
+      }
       cb(null, dir);
     },
     filename: (req, _file, cb) => {
       const idx = parseInt(req.body?.partIndex ?? "", 10);
+      // SEC: reject NaN/out-of-range partIndex here so multer never writes an
+      // orphan "part_NaN" file that would accumulate on disk indefinitely.
+      if (isNaN(idx) || idx < 0 || idx >= MAX_CHUNK_COUNT) {
+        cb(new Error("Geçersiz partIndex"), "");
+        return;
+      }
       cb(null, `part_${idx}`);
     },
   }),
@@ -445,18 +488,27 @@ router.post(
       res.status(400).json({ error: "Geçersiz uploadId veya partIndex" });
       return;
     }
-    // SEC-DoS: reject partIndex >= MAX_CHUNK_COUNT to prevent filesystem exhaustion
-    if (partIndex >= MAX_CHUNK_COUNT) {
-      res.status(400).json({ error: `partIndex çok büyük (maks ${MAX_CHUNK_COUNT - 1})` });
-      return;
-    }
-    // SEC-IDOR: verify this request comes from the same session that called upload-init
-    if (uploadSessions.get(uploadId) !== req.sessionID) {
-      res.status(403).json({ error: "Bu yükleme oturumu size ait değil" });
-      return;
-    }
     if (!req.file) {
       res.status(400).json({ error: "Part verisi bulunamadı" });
+      return;
+    }
+    // SEC-DoS: track cumulative received bytes; reject if the running total
+    // exceeds the client-declared size (+ 1 % framing overhead, capped at
+    // MAX_FILE_SIZE). This prevents disk exhaustion via 10 k × 5 MB parts
+    // that would only be caught by the quota check at finalize time.
+    const rec = uploadSessions.get(uploadId);
+    if (!rec) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      res.status(403).json({ error: "Bu yükleme oturumu bulunamadı veya süresi doldu" });
+      return;
+    }
+    rec.receivedBytes += req.file.size;
+    const ceiling = Math.min(rec.maxBytes * 1.01 + 1024, MAX_FILE_SIZE);
+    if (rec.receivedBytes > ceiling) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      uploadSessions.delete(uploadId);
+      cleanupUpload(uploadId);
+      res.status(413).json({ error: "Toplam yükleme boyutu bildirilen boyutu aşıyor" });
       return;
     }
 
@@ -488,7 +540,7 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     return;
   }
   // SEC-IDOR: verify this request comes from the same session that called upload-init
-  if (uploadSessions.get(uploadId) !== req.sessionID) {
+  if (uploadSessions.get(uploadId)?.sessionId !== req.sessionID) {
     res.status(403).json({ error: "Bu yükleme oturumu size ait değil" });
     return;
   }
@@ -598,57 +650,6 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     req.log.error({ err }, "Finalise failed");
     res.status(500).json({ error: "Dosya birleştirme başarısız" });
   }
-});
-
-router.post("/files/register-seed", requireAuth, uploadLimiter, async (req, res): Promise<void> => {
-  const { name, size, mimeType, chunkCount, folderId } = req.body as {
-    name: string;
-    size: number;
-    mimeType: string;
-    chunkCount: number;
-    folderId?: string;
-  };
-
-  if (!name || !size || !mimeType || !chunkCount) {
-    res.status(400).json({ error: "Eksik alanlar: name, size, mimeType, chunkCount" });
-    return;
-  }
-  if (typeof name !== "string" || name.length > 512) {
-    res.status(400).json({ error: "Geçersiz dosya adı" });
-    return;
-  }
-  if (typeof size !== "number" || size <= 0 || size > MAX_SEED_SIZE) {
-    res.status(400).json({ error: "Geçersiz boyut" });
-    return;
-  }
-  if (!Number.isInteger(chunkCount) || chunkCount <= 0 || chunkCount > MAX_CHUNK_COUNT) {
-    res.status(400).json({ error: "Geçersiz chunkCount" });
-    return;
-  }
-
-  ensureUploadsDir();
-  const fileId = uuidv4();
-  const resolvedFolderMeta = folderId && isValidFolderId(folderId) ? readFolderMeta(folderId) : null;
-    // BUL-16: verify folder belongs to current user before assigning
-    const resolvedFolderId = resolvedFolderMeta?.userId === req.session.userId ? folderId : undefined;
-
-  const meta: FileMeta = {
-    id: fileId,
-    userId: req.session.userId,
-    name: String(name).slice(0, 512),
-    size: Number(size),
-    mimeType: String(mimeType).slice(0, 128),
-    chunkCount: Number(chunkCount),
-    chunkSize: CHUNK_SIZE,
-    uploadedAt: new Date().toISOString(),
-    chunkUrls: [],
-    seedOnly: true,
-    ...(resolvedFolderId ? { folderId: resolvedFolderId } : {}),
-  };
-
-  saveMeta(meta);
-  req.log.info({ fileId, name: meta.name }, "Seed-only file registered");
-  res.status(201).json(meta);
 });
 
 router.get("/files", requireAuth, async (req, res): Promise<void> => {

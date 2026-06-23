@@ -58,7 +58,6 @@ const TTL_OPTIONS: Record<string, number> = {
 };
 
 const MAX_CHUNK_COUNT = 10_000;
-const MAX_SEED_SIZE = 50 * 1024 * 1024 * 1024;
 
 function getBaseUrl(req: {
   protocol: string;
@@ -386,64 +385,6 @@ router.post("/files/upload-finalize", async (req, res): Promise<void> => {
     req.log.error({ err }, "Finalise failed");
     res.status(500).json({ error: "Failed to assemble file" });
   }
-});
-
-// ── POST /files/register-seed ─────────────────────────────────────────────────
-router.post("/files/register-seed", async (req, res): Promise<void> => {
-  // BUG-04 fix: require authentication — only logged-in users may register a seed
-  const userId = req.session?.userId;
-  if (!userId) {
-    res.status(401).json({ error: "Bu işlem için giriş yapmanız gerekiyor" });
-    return;
-  }
-
-  const { name, size, mimeType, chunkCount, folderId } = req.body as {
-    name: string;
-    size: number;
-    mimeType: string;
-    chunkCount: number;
-    folderId?: string;
-  };
-
-  if (!name || !size || !mimeType || !chunkCount) {
-    res.status(400).json({ error: "Missing required fields: name, size, mimeType, chunkCount" });
-    return;
-  }
-  if (typeof name !== "string" || name.length > 512) {
-    res.status(400).json({ error: "Invalid file name" });
-    return;
-  }
-  if (typeof size !== "number" || size <= 0 || size > MAX_SEED_SIZE) {
-    res.status(400).json({ error: `Invalid size (max ${MAX_SEED_SIZE} bytes)` });
-    return;
-  }
-  if (!Number.isInteger(chunkCount) || chunkCount <= 0 || chunkCount > MAX_CHUNK_COUNT) {
-    res.status(400).json({ error: `Invalid chunkCount (max ${MAX_CHUNK_COUNT})` });
-    return;
-  }
-
-  ensureUploadsDir();
-  const fileId = uuidv4();
-  const resolvedFolderId = folderId && isValidFolderId(folderId) && readFolderMeta(folderId)
-    ? folderId : undefined;
-
-  const meta: FileMeta = {
-    id: fileId,
-    userId,
-    name: String(name).slice(0, 512),
-    size: Number(size),
-    mimeType: String(mimeType).slice(0, 128),
-    chunkCount: Number(chunkCount),
-    chunkSize: CHUNK_SIZE,
-    uploadedAt: new Date().toISOString(),
-    chunkUrls: [],
-    seedOnly: true,
-    ...(resolvedFolderId ? { folderId: resolvedFolderId } : {}),
-  };
-
-  saveMeta(meta);
-  req.log.info({ fileId, name: meta.name, chunkCount, folderId: resolvedFolderId }, "Seed-only file registered");
-  res.status(201).json(meta);
 });
 
 // ── GET /files ────────────────────────────────────────────────────────────────

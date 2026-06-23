@@ -20,15 +20,6 @@ export interface FileInfo {
   chunkUrls: string[];
   /** @nullable */
   expiresAt?: string | null;
-  /** @nullable */
-  seedOnly?: boolean | null;
-}
-
-export interface SeedInput {
-  name: string;
-  size: number;
-  mimeType: string;
-  chunkCount: number;
 }
 
 export interface SnippetResponse {

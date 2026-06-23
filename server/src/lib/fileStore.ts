@@ -7,15 +7,23 @@ export const uploadsDir =
     ? "/uploads"
     : path.resolve(process.cwd(), "uploads");
 
-export const CHUNK_SIZE =
-  Math.max(1, Math.min(100, Number(process.env["CHUNK_SIZE_MB"] ?? 1))) * 1024 * 1024;
+// SEC: use `|| default` (not `?? default`) so that a non-numeric env value
+// (e.g. "abc") produces NaN from Number(), which is falsy, and falls back to
+// the safe default — `?? default` only guards undefined/null, not NaN.
 
+// CHUNK_SIZE: capped at 100 MB per part — larger chunks cause memory pressure.
+export const CHUNK_SIZE =
+  Math.max(1, Math.min(100, Number(process.env["CHUNK_SIZE_MB"]) || 1)) * 1024 * 1024;
+
+// MAX_FILE_SIZE: fully controlled by MAX_FILE_SIZE_MB env var with no hard
+// upper cap — the operator sets the limit and it is respected exactly.
+// Minimum is 1 MB; default (no env var) is 500 MB.
 export const MAX_FILE_SIZE =
-  Math.max(1, Math.min(102400, Number(process.env["MAX_FILE_SIZE_MB"] ?? 500))) * 1024 * 1024;
+  Math.max(1, Number(process.env["MAX_FILE_SIZE_MB"]) || 500) * 1024 * 1024;
 
 // BUL-08: per-user total storage quota (default 5 GB, overridable via env)
 export const MAX_USER_STORAGE_BYTES =
-  Math.max(1, Number(process.env["MAX_USER_STORAGE_MB"] ?? 5000)) * 1024 * 1024;
+  Math.max(1, Number(process.env["MAX_USER_STORAGE_MB"]) || 5000) * 1024 * 1024;
 
 export interface FileMeta {
   id: string;
@@ -28,7 +36,6 @@ export interface FileMeta {
   uploadedAt: string;
   chunkUrls: string[];
   expiresAt?: string;
-  seedOnly?: boolean;
   sha256?: string;
   groupId?: string;
   version?: number;
@@ -378,6 +385,34 @@ export function generateSnippet(meta: FileMeta, baseUrl: string): string {
   window.FileSplit = window.FileSplit || {};
   window.FileSplit["${meta.id}"] = { download: downloadFile, fileName: fileName };
 })();`;
+}
+
+// SEC: clean up orphan upload temp directories and leftover tmp_ files that
+// accumulate when a client crashes or navigates away mid-upload. Called from
+// index.ts alongside the hourly purgeExpiredFiles() sweep.
+export function purgeStaleUploadDirs(maxAgeMs = 24 * 60 * 60 * 1000): number {
+  ensureUploadsDir();
+  const entries = fs.readdirSync(uploadsDir, { withFileTypes: true });
+  let count = 0;
+  const cutoff = Date.now() - maxAgeMs;
+  for (const entry of entries) {
+    try {
+      if (entry.isDirectory() && entry.name.startsWith("upload_")) {
+        const stat = fs.statSync(path.join(uploadsDir, entry.name));
+        if (stat.mtimeMs < cutoff) {
+          fs.rmSync(path.join(uploadsDir, entry.name), { recursive: true, force: true });
+          count++;
+        }
+      } else if (entry.isFile() && entry.name.startsWith("tmp_")) {
+        const stat = fs.statSync(path.join(uploadsDir, entry.name));
+        if (stat.mtimeMs < cutoff) {
+          fs.unlinkSync(path.join(uploadsDir, entry.name));
+          count++;
+        }
+      }
+    } catch { /* skip entries we can't stat/delete */ }
+  }
+  return count;
 }
 
 export function sha256File(filePath: string): string {
