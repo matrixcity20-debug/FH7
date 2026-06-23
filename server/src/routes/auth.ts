@@ -43,8 +43,9 @@ router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
   const trimmedUsername = username.trim();
 
   if (await usernameExists(trimmedUsername)) {
-    // SEC-enum: prevent username enumeration — return a generic success-shaped
-    // response so an attacker cannot distinguish "taken" from "registered".
+    // SEC-enum: equalize timing with the real registration path (bcrypt ~100ms)
+    // so an attacker cannot distinguish "taken" from "registered" by response time.
+    await bcrypt.hash(password, 12);
     res.status(201).json({ message: "Kayıt tamamlandı. Giriş yapmayı deneyin." });
     return;
   }

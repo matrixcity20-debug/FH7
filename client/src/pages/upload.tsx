@@ -9,6 +9,7 @@ import { Progress } from "@/components/ui/progress";
 import { toast } from "@/hooks/use-toast";
 
 import { hashFileStreaming } from "@/lib/sha256";
+import { getIceServers } from "@/lib/iceServers";
 
 const TTL_OPTIONS = [
   { value: "", label: "Hiç dolmasın" },
@@ -305,7 +306,8 @@ export default function UploadPage() {
 
         if (msg.type === "peer-joined") {
           const leecherId = msg.leecherId as string;
-          const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+          const iceServers = await getIceServers();
+          const pc = new RTCPeerConnection({ iceServers });
           peersRef.current.set(leecherId, pc);
           // BUG-03 fix: initialise per-peer state in the central maps
           pendingCandidatesRef.current.set(leecherId, []);

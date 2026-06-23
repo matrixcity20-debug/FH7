@@ -16,6 +16,7 @@ import { toast } from "@/hooks/use-toast";
 import { Link } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
 import { SHA256Stream } from "@/lib/sha256";
+import { getIceServers } from "@/lib/iceServers";
 
 interface FileMeta {
   id: string;
@@ -157,7 +158,8 @@ function P2PDownloader({ fileId, fileName, fileSize, mimeType }: { fileId: strin
       }
 
       if (msg.type === "offer") {
-        const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+        const iceServers = await getIceServers();
+        const pc = new RTCPeerConnection({ iceServers });
         pcRef.current = pc;
         pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: "ice", to: msg.from, candidate: e.candidate })); };
 
