@@ -11,7 +11,7 @@ export const CHUNK_SIZE =
   Math.max(1, Math.min(100, Number(process.env["CHUNK_SIZE_MB"] ?? 1))) * 1024 * 1024;
 
 export const MAX_FILE_SIZE =
-  Math.max(1, Math.min(2000, Number(process.env["MAX_FILE_SIZE_MB"] ?? 500))) * 1024 * 1024;
+  Math.max(1, Math.min(102400, Number(process.env["MAX_FILE_SIZE_MB"] ?? 500))) * 1024 * 1024;
 
 // BUL-08: per-user total storage quota (default 5 GB, overridable via env)
 export const MAX_USER_STORAGE_BYTES =
