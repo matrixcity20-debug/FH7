@@ -390,6 +390,13 @@ router.post("/files/upload-finalize", async (req, res): Promise<void> => {
 
 // ── POST /files/register-seed ─────────────────────────────────────────────────
 router.post("/files/register-seed", async (req, res): Promise<void> => {
+  // BUG-04 fix: require authentication — only logged-in users may register a seed
+  const userId = req.session?.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Bu işlem için giriş yapmanız gerekiyor" });
+    return;
+  }
+
   const { name, size, mimeType, chunkCount, folderId } = req.body as {
     name: string;
     size: number;
@@ -422,6 +429,7 @@ router.post("/files/register-seed", async (req, res): Promise<void> => {
 
   const meta: FileMeta = {
     id: fileId,
+    userId,
     name: String(name).slice(0, 512),
     size: Number(size),
     mimeType: String(mimeType).slice(0, 128),

@@ -15,6 +15,7 @@ import { Switch } from "@/components/ui/switch";
 import { toast } from "@/hooks/use-toast";
 import { Link } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
+import { SHA256Stream } from "@/lib/sha256";
 
 interface FileMeta {
   id: string;
@@ -69,6 +70,8 @@ function MetaRow({ label, value, className }: { label: string; value: React.Reac
 type P2PStatus = "idle" | "connecting" | "receiving" | "done" | "error" | "offline";
 type SeederPresence = "checking" | "online" | "offline" | "unknown";
 
+const CONNECT_TIMEOUT_MS = 30_000;
+
 function P2PDownloader({ fileId, fileName, fileSize, mimeType }: { fileId: string; fileName: string; fileSize: number; mimeType: string }) {
   const [status, setStatus] = useState<P2PStatus>("idle");
   const [progress, setProgress] = useState(0);
@@ -76,6 +79,14 @@ function P2PDownloader({ fileId, fileName, fileSize, mimeType }: { fileId: strin
   const [presence, setPresence] = useState<SeederPresence>("checking");
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
+  // BUG-01 fix: queue ICE candidates that arrive before setRemoteDescription completes
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const remoteReadyRef = useRef(false);
+  // BUG-06 fix: connection timeout handle
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // BUG-I fix: auto-reconnect on ICE failure — cap at MAX_RETRIES to avoid infinite loop
+  const retryCountRef = useRef(0);
+  const MAX_RETRIES = 3;
 
   useEffect(() => {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
@@ -94,50 +105,153 @@ function P2PDownloader({ fileId, fileName, fileSize, mimeType }: { fileId: strin
   }, [fileId]);
 
   useEffect(() => {
-    return () => { wsRef.current?.close(); pcRef.current?.close(); };
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      wsRef.current?.close();
+      pcRef.current?.close();
+    };
   }, []);
 
-  const startDownload = () => {
+  const cancelDownload = () => {
+    if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
+    wsRef.current?.close();
+    pcRef.current?.close();
+    pcRef.current = null;
+    pendingCandidatesRef.current = [];
+    remoteReadyRef.current = false;
+    setStatus("idle");
+    setErrorMsg("");
+  };
+
+  const startDownload = (isRetry = false) => {
+    if (!isRetry) retryCountRef.current = 0;
     setStatus("connecting"); setProgress(0); setErrorMsg("");
+    pendingCandidatesRef.current = [];
+    remoteReadyRef.current = false;
+
+    // BUG-06 fix: abort after CONNECT_TIMEOUT_MS if seeder never completes handshake
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      wsRef.current?.close();
+      pcRef.current?.close();
+      pcRef.current = null;
+      pendingCandidatesRef.current = [];
+      remoteReadyRef.current = false;
+      setStatus("error");
+      setErrorMsg(`Bağlantı zaman aşımı (${CONNECT_TIMEOUT_MS / 1000}s). Seeder yanıt vermedi.`);
+    }, CONNECT_TIMEOUT_MS);
+
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
     wsRef.current = ws;
     ws.onopen = () => ws.send(JSON.stringify({ type: "leech", fileId }));
     ws.onmessage = async (event) => {
       const msg = JSON.parse(event.data as string) as Record<string, unknown>;
-      if (msg.type === "seeder-offline") { setStatus("offline"); setErrorMsg("Seeder çevrimdışı. Dosya sahibinin tarayıcısı açık değil."); ws.close(); return; }
+
+      if (msg.type === "seeder-offline") {
+        if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
+        setStatus("offline");
+        setErrorMsg("Seeder çevrimdışı. Dosya sahibinin tarayıcısı açık değil.");
+        ws.close();
+        return;
+      }
+
       if (msg.type === "offer") {
         const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
         pcRef.current = pc;
         pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: "ice", to: msg.from, candidate: e.candidate })); };
+
+        // BUG-I fix: auto-reconnect on ICE failure (up to MAX_RETRIES times)
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === "failed") {
+            ws.close();
+            pc.close();
+            if (retryCountRef.current < MAX_RETRIES) {
+              retryCountRef.current++;
+              setErrorMsg(`Bağlantı kesildi — yeniden deneniyor (${retryCountRef.current}/${MAX_RETRIES})…`);
+              setTimeout(() => startDownload(true), 2_000);
+            } else {
+              setStatus("error");
+              setErrorMsg(`ICE bağlantısı başarısız oldu. ${MAX_RETRIES} otomatik deneme tükendi.`);
+            }
+          }
+        };
+
         const receivedChunks: ArrayBuffer[] = [];
-        let headerParsed = false, totalChunks = 0;
+        let headerParsed = false, totalChunks = 0, expectedSha256 = "";
+
         pc.ondatachannel = (e) => {
           const dc = e.channel;
+          // BUG-09 fix: ensure binary messages arrive as ArrayBuffer, not Blob
+          dc.binaryType = "arraybuffer";
           setStatus("receiving");
+          if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
           dc.onmessage = (ev) => {
-            if (!headerParsed) { const h = JSON.parse(ev.data as string) as { chunkCount: number }; totalChunks = h.chunkCount; headerParsed = true; return; }
+            if (!headerParsed) {
+              // BUG-E fix: read expected sha256 from seeder header for integrity check
+              const h = JSON.parse(ev.data as string) as { chunkCount: number; sha256?: string };
+              totalChunks = h.chunkCount;
+              expectedSha256 = h.sha256 ?? "";
+              headerParsed = true;
+              return;
+            }
             if (ev.data === "__DONE__") {
-              const blob = new Blob(receivedChunks, { type: mimeType });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a"); a.href = url; a.download = fileName;
-              document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-              setStatus("done"); setProgress(100); ws.close(); return;
+              // BUG-E fix: verify SHA-256 of received data before triggering download
+              const finalize = () => {
+                if (expectedSha256) {
+                  const sha = new SHA256Stream();
+                  for (const chunk of receivedChunks) {
+                    sha.update(new Uint8Array(chunk));
+                  }
+                  const actualHash = sha.digest();
+                  if (actualHash !== expectedSha256) {
+                    setStatus("error");
+                    setErrorMsg("Bütünlük kontrolü başarısız — alınan veri bozulmuş veya değiştirilmiş olabilir.");
+                    ws.close();
+                    return;
+                  }
+                }
+                const blob = new Blob(receivedChunks, { type: mimeType });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a"); a.href = url; a.download = fileName;
+                document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+                setStatus("done"); setProgress(100); ws.close();
+              };
+              finalize();
+              return;
             }
             receivedChunks.push(ev.data as ArrayBuffer);
             if (totalChunks > 0) setProgress(Math.round((receivedChunks.length / totalChunks) * 100));
           };
         };
+
+        // BUG-01 fix: set remote first, then flush any queued ICE candidates
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
+        remoteReadyRef.current = true;
+        for (const c of pendingCandidatesRef.current) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { /* ignore */ }
+        }
+        pendingCandidatesRef.current = [];
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         ws.send(JSON.stringify({ type: "answer", to: msg.from, sdp: pc.localDescription }));
       }
-      if (msg.type === "ice" && pcRef.current) {
-        try { await pcRef.current.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit)); } catch { /* ignore */ }
+
+      if (msg.type === "ice") {
+        // BUG-01 fix: queue if remote description isn't set yet; add immediately otherwise
+        if (remoteReadyRef.current && pcRef.current) {
+          try { await pcRef.current.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit)); } catch { /* ignore */ }
+        } else {
+          pendingCandidatesRef.current.push(msg.candidate as RTCIceCandidateInit);
+        }
       }
     };
-    ws.onerror = () => { setStatus("error"); setErrorMsg("WebSocket bağlantısı başarısız."); };
+    ws.onerror = () => {
+      if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
+      setStatus("error");
+      setErrorMsg("WebSocket bağlantısı başarısız.");
+    };
   };
 
   return (
@@ -161,7 +275,11 @@ function P2PDownloader({ fileId, fileName, fileSize, mimeType }: { fileId: strin
       {status === "connecting" && (
         <div className="flex flex-col items-center gap-3 py-4">
           <Loader2 className="w-8 h-8 text-primary animate-spin" />
-          <p className="text-xs font-mono text-muted-foreground">Seeder'a bağlanılıyor...</p>
+          <p className="text-xs font-mono text-muted-foreground">Seeder'a bağlanılıyor…</p>
+          {/* BUG-06 fix: cancel button so the UI never stays frozen */}
+          <Button variant="ghost" size="sm" className="text-xs font-mono text-muted-foreground" onClick={cancelDownload}>
+            İptal
+          </Button>
         </div>
       )}
       {status === "receiving" && (

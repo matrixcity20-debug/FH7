@@ -67,35 +67,41 @@ ChartContainer.displayName = "Chart"
 
 const ChartStyle = ({ id, config }: { id: string; config: ChartConfig }) => {
   const colorConfig = Object.entries(config).filter(
-    ([, config]) => config.theme || config.color
+    ([, cfg]) => cfg.theme || cfg.color
   )
+  const styleRef = React.useRef<HTMLStyleElement>(null)
+
+  // SEC: avoid dangerouslySetInnerHTML — set textContent via ref instead.
+  // Content is application-controlled (theme colors from ChartConfig props),
+  // but removing dangerouslySetInnerHTML closes the door to future misuse.
+  React.useEffect(() => {
+    const el = styleRef.current
+    if (!el) return
+    if (!colorConfig.length) { el.textContent = ""; return }
+    el.textContent = Object.entries(THEMES)
+      .map(([theme, prefix]) => {
+        const vars = colorConfig
+          .map(([key, itemConfig]) => {
+            const color =
+              itemConfig.theme?.[theme as keyof typeof itemConfig.theme] ||
+              itemConfig.color
+            return color ? `  --color-${key}: ${color};` : null
+          })
+          .filter(Boolean)
+          .join("\n")
+        return vars ? `${prefix} [data-chart=${id}] {\n${vars}\n}` : ""
+      })
+      .filter(Boolean)
+      .join("\n\n")
+  // config reference changes trigger re-runs; serialise to detect deep changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, config])
 
   if (!colorConfig.length) {
     return null
   }
 
-  return (
-    <style
-      dangerouslySetInnerHTML={{
-        __html: Object.entries(THEMES)
-          .map(
-            ([theme, prefix]) => `
-${prefix} [data-chart=${id}] {
-${colorConfig
-  .map(([key, itemConfig]) => {
-    const color =
-      itemConfig.theme?.[theme as keyof typeof itemConfig.theme] ||
-      itemConfig.color
-    return color ? `  --color-${key}: ${color};` : null
-  })
-  .join("\n")}
-}
-`
-          )
-          .join("\n"),
-      }}
-    />
-  )
+  return <style ref={styleRef} />
 }
 
 const ChartTooltip = RechartsPrimitive.Tooltip

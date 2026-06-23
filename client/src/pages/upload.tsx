@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "@/hooks/use-toast";
 
+import { hashFileStreaming } from "@/lib/sha256";
+
 const TTL_OPTIONS = [
   { value: "", label: "Hiç dolmasın" },
   { value: "1h", label: "1 saat" },
@@ -37,34 +39,6 @@ async function parseErrorMessage(res: Response): Promise<string> {
     if (typeof json.message === "string") return json.message;
   } catch { /* ignore */ }
   return res.statusText || "Bir hata oluştu";
-}
-
-function readFileChunks(
-  file: File,
-  onProgress?: (done: number, total: number) => void,
-): Promise<ArrayBuffer[]> {
-  return new Promise((resolve, reject) => {
-    const chunkCount = Math.ceil(file.size / CHUNK_SIZE);
-    const chunks: ArrayBuffer[] = [];
-    let index = 0;
-
-    function readNext() {
-      if (index >= chunkCount) { resolve(chunks); return; }
-      const slice = file.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE);
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        if (!e.target?.result) { reject(new Error("Chunk okunamadı")); return; }
-        chunks.push(e.target.result as ArrayBuffer);
-        index++;
-        onProgress?.(index, chunkCount);
-        readNext();
-      };
-      reader.onerror = () => reject(reader.error);
-      reader.readAsArrayBuffer(slice);
-    }
-
-    readNext();
-  });
 }
 
 interface FolderMeta {
@@ -109,9 +83,14 @@ export default function UploadPage() {
   const [selectedFolderId, setSelectedFolderId] = useState<string>("");
   const inputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const chunksRef = useRef<ArrayBuffer[]>([]);
+  const chunksRef = useRef<ArrayBuffer[]>([]); // kept for resetState cleanup compat
+  // BUG-G fix: sha256 of the seeded file is computed once, included in every DC header
+  const sha256Ref = useRef<string>("");
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const abortRef = useRef(false);
+  // BUG-03 fix: central per-peer ICE queues and remote-ready flags (replaces per-peer addEventListener)
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const remoteSetRef = useRef<Map<string, boolean>>(new Map());
 
   useEffect(() => {
     fetch("/api/folders", { credentials: "include" })
@@ -168,6 +147,8 @@ export default function UploadPage() {
     wsRef.current?.close();
     peersRef.current.forEach((pc) => pc.close());
     peersRef.current.clear();
+    pendingCandidatesRef.current.clear();
+    remoteSetRef.current.clear();
     chunksRef.current = [];
     abortRef.current = false;
     setUploadStep({ phase: "idle" });
@@ -202,12 +183,9 @@ export default function UploadPage() {
 
     try {
       setUploadStep({ phase: "hashing" });
-      const fileBuffer = await file.arrayBuffer();
+      // BUG-08 fix: stream the file in 2 MB chunks — never loads the whole file
+      const sha256 = await hashFileStreaming(file, 2 * 1024 * 1024);
       if (abortRef.current) return;
-      const hashBuffer = await crypto.subtle.digest("SHA-256", fileBuffer);
-      const sha256 = Array.from(new Uint8Array(hashBuffer))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
 
       const initRes = await fetch("/api/files/upload-init", {
         method: "POST",
@@ -299,12 +277,14 @@ export default function UploadPage() {
       const meta = await res.json() as { id: string };
       const fileId = meta.id;
 
-      setUploadStep({ phase: "chunking", done: 0, total: chunkCount });
-      const chunks = await readFileChunks(file, (done, total) => {
-        if (!abortRef.current) setUploadStep({ phase: "chunking", done, total });
+      // BUG-G fix: stream the file in CHUNK_SIZE slices to compute sha256 — no full-RAM load.
+      // BUG-E fix: hash is stored and forwarded to leechers for integrity verification.
+      setUploadStep({ phase: "chunking", done: 0, total: file.size });
+      const fileSha256 = await hashFileStreaming(file, CHUNK_SIZE, (done) => {
+        if (!abortRef.current) setUploadStep({ phase: "chunking", done, total: file.size });
       });
       if (abortRef.current) return;
-      chunksRef.current = chunks;
+      sha256Ref.current = fileSha256;
 
       setUploadStep({ phase: "connecting" });
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
@@ -327,6 +307,9 @@ export default function UploadPage() {
           const leecherId = msg.leecherId as string;
           const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
           peersRef.current.set(leecherId, pc);
+          // BUG-03 fix: initialise per-peer state in the central maps
+          pendingCandidatesRef.current.set(leecherId, []);
+          remoteSetRef.current.set(leecherId, false);
           setSeederState((prev) => prev ? { ...prev, connectedPeers: prev.connectedPeers + 1 } : prev);
 
           const dc = pc.createDataChannel("file", { ordered: true });
@@ -347,14 +330,17 @@ export default function UploadPage() {
 
           dc.onopen = async () => {
             if (dc.readyState !== "open") return;
-            dc.send(JSON.stringify({ name: file.name, size: file.size, mimeType: file.type || "application/octet-stream", chunkCount: chunksRef.current.length }));
-            for (const chunk of chunksRef.current) {
+            // BUG-E fix: include sha256 so leecher can verify integrity
+            // BUG-G fix: chunks are read on-demand here — never pre-loaded into chunksRef
+            dc.send(JSON.stringify({ name: file.name, size: file.size, mimeType: file.type || "application/octet-stream", chunkCount, sha256: sha256Ref.current }));
+            for (let i = 0; i < chunkCount; i++) {
               if (dc.readyState !== "open") break;
               while (dc.bufferedAmount > BUFFER_HIGH) {
                 if (dc.readyState !== "open") break;
                 await waitForDrain();
               }
               if (dc.readyState !== "open") break;
+              const chunk = await file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE).arrayBuffer();
               dc.send(chunk);
               setSeederState((prev) => prev ? { ...prev, bytesServed: prev.bytesServed + chunk.byteLength } : prev);
             }
@@ -364,11 +350,10 @@ export default function UploadPage() {
           dc.onclose = () => {
             setSeederState((prev) => prev ? { ...prev, connectedPeers: Math.max(0, prev.connectedPeers - 1) } : prev);
             peersRef.current.delete(leecherId);
+            pendingCandidatesRef.current.delete(leecherId);
+            remoteSetRef.current.delete(leecherId);
             pc.close();
           };
-
-          const pendingCandidates: RTCIceCandidateInit[] = [];
-          let remoteSet = false;
 
           pc.onicecandidate = (e) => {
             if (e.candidate) ws.send(JSON.stringify({ type: "ice", to: leecherId, candidate: e.candidate }));
@@ -377,25 +362,36 @@ export default function UploadPage() {
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           ws.send(JSON.stringify({ type: "offer", to: leecherId, sdp: pc.localDescription }));
+          // BUG-03 fix: answer/ice are handled below in the same onmessage — no per-peer addEventListener
+        }
 
-          ws.addEventListener("message", async (ev: MessageEvent) => {
-            const m = JSON.parse(ev.data as string) as Record<string, unknown>;
-            if (m.type === "answer" && m.from === leecherId) {
-              await pc.setRemoteDescription(new RTCSessionDescription(m.sdp as RTCSessionDescriptionInit));
-              remoteSet = true;
-              for (const c of pendingCandidates) {
-                try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { /* ignore */ }
-              }
-              pendingCandidates.length = 0;
+        // BUG-03 fix: central dispatch for answer and ice — one handler, no per-peer listener accumulation
+        if (msg.type === "answer") {
+          const from = msg.from as string;
+          const pc = peersRef.current.get(from);
+          if (pc) {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
+            remoteSetRef.current.set(from, true);
+            const pending = pendingCandidatesRef.current.get(from) ?? [];
+            for (const c of pending) {
+              try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { /* ignore */ }
             }
-            if (m.type === "ice" && m.from === leecherId) {
-              if (remoteSet) {
-                try { await pc.addIceCandidate(new RTCIceCandidate(m.candidate as RTCIceCandidateInit)); } catch { /* ignore */ }
-              } else {
-                pendingCandidates.push(m.candidate as RTCIceCandidateInit);
-              }
+            pendingCandidatesRef.current.set(from, []);
+          }
+        }
+
+        if (msg.type === "ice") {
+          const from = msg.from as string;
+          const pc = peersRef.current.get(from);
+          if (pc) {
+            if (remoteSetRef.current.get(from)) {
+              try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit)); } catch { /* ignore */ }
+            } else {
+              const pending = pendingCandidatesRef.current.get(from) ?? [];
+              pending.push(msg.candidate as RTCIceCandidateInit);
+              pendingCandidatesRef.current.set(from, pending);
             }
-          });
+          }
         }
       };
 
@@ -418,6 +414,8 @@ export default function UploadPage() {
     wsRef.current?.close();
     peersRef.current.forEach((pc) => pc.close());
     peersRef.current.clear();
+    pendingCandidatesRef.current.clear();
+    remoteSetRef.current.clear();
     setSeederState(null);
     setFile(null);
     chunksRef.current = [];
@@ -425,7 +423,8 @@ export default function UploadPage() {
   };
 
   if (seederState) {
-    const shareUrl = `${window.location.origin}/filesplit/files/${seederState.fileId}`;
+    // BUG-05 fix: corrected base path — /filesplit/files/ does not exist
+    const shareUrl = `${window.location.origin}/files/${seederState.fileId}`;
     const isOnline = seederState.status === "seeding";
 
     return (

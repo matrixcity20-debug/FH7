@@ -74,6 +74,28 @@ const TTL_OPTIONS: Record<string, number> = {
 const MAX_CHUNK_COUNT = 10_000;
 const MAX_SEED_SIZE = 50 * 1024 * 1024 * 1024;
 
+// ── SEC: MIME type allowlist ──────────────────────────────────────────────────
+// Client-supplied mimeType is stored and later served as Content-Type.
+// Dangerous types can enable XSS / MIME-confusion attacks in some browsers.
+const BLOCKED_MIME_TYPES = new Set([
+  "text/html", "text/xml", "application/xhtml+xml",
+  "text/javascript", "application/javascript", "application/x-javascript",
+  "application/xml", "image/svg+xml",
+]);
+
+function sanitizeMimeType(raw: string): string {
+  const lower = (raw || "").toLowerCase().split(";")[0].trim();
+  return BLOCKED_MIME_TYPES.has(lower) ? "application/octet-stream" : (lower || "application/octet-stream").slice(0, 128);
+}
+
+// ── SEC: per-upload session ownership ────────────────────────────────────────
+// Maps uploadId → sessionID; prevents a different session from injecting parts
+// into an in-progress upload it did not initiate (IDOR on chunked upload).
+const uploadSessions = new Map<string, string>();
+
+// Maximum number of file IDs kept in a session's unlockedFiles list
+const MAX_UNLOCKED_FILES = 200;
+
 // BUL-08: per-user upload rate limit (50 uploads/hour)
 const uploadLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
@@ -332,7 +354,7 @@ router.post(
         userId: req.session.userId,
         name: req.file.originalname,
         size: fileSize,
-        mimeType: req.file.mimetype || "application/octet-stream",
+        mimeType: sanitizeMimeType(req.file.mimetype || "application/octet-stream"),
         chunkCount,
         chunkSize: CHUNK_SIZE,
         uploadedAt: new Date().toISOString(),
@@ -385,6 +407,9 @@ router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): 
   const uploadId = uuidv4();
   ensureUploadsDir();
   fs.mkdirSync(getUploadTempDir(uploadId), { recursive: true });
+  // SEC-IDOR: bind this uploadId to the current session so upload-part and
+  // upload-finalize can reject requests from a different session.
+  uploadSessions.set(uploadId, req.sessionID);
 
   req.log.info({ uploadId, name, size }, "Upload session initialised");
   res.status(201).json({ uploadId, partSize: UPLOAD_PART_SIZE });
@@ -420,6 +445,16 @@ router.post(
       res.status(400).json({ error: "Geçersiz uploadId veya partIndex" });
       return;
     }
+    // SEC-DoS: reject partIndex >= MAX_CHUNK_COUNT to prevent filesystem exhaustion
+    if (partIndex >= MAX_CHUNK_COUNT) {
+      res.status(400).json({ error: `partIndex çok büyük (maks ${MAX_CHUNK_COUNT - 1})` });
+      return;
+    }
+    // SEC-IDOR: verify this request comes from the same session that called upload-init
+    if (uploadSessions.get(uploadId) !== req.sessionID) {
+      res.status(403).json({ error: "Bu yükleme oturumu size ait değil" });
+      return;
+    }
     if (!req.file) {
       res.status(400).json({ error: "Part verisi bulunamadı" });
       return;
@@ -445,6 +480,16 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
 
   if (!uploadId || !isValidUploadId(uploadId) || !name || !size || !mimeType || !totalParts || !sha256) {
     res.status(400).json({ error: "Eksik alanlar var" });
+    return;
+  }
+  // SEC-DoS: reject unreasonably large totalParts before touching the filesystem
+  if (!Number.isInteger(totalParts) || totalParts <= 0 || totalParts > MAX_CHUNK_COUNT) {
+    res.status(400).json({ error: `Geçersiz totalParts (maks ${MAX_CHUNK_COUNT})` });
+    return;
+  }
+  // SEC-IDOR: verify this request comes from the same session that called upload-init
+  if (uploadSessions.get(uploadId) !== req.sessionID) {
+    res.status(403).json({ error: "Bu yükleme oturumu size ait değil" });
     return;
   }
 
@@ -530,7 +575,7 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
       userId: req.session.userId,
       name,
       size: measuredBytes,
-      mimeType: mimeType || "application/octet-stream",
+      mimeType: sanitizeMimeType(mimeType),
       chunkCount,
       chunkSize: CHUNK_SIZE,
       uploadedAt: new Date().toISOString(),
@@ -542,9 +587,12 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     };
 
     saveMeta(meta);
+    // SEC-IDOR: release the uploadId → sessionID binding now that finalize is done
+    uploadSessions.delete(uploadId);
     req.log.info({ fileId, name, chunkCount }, "Chunked upload finalised");
     res.status(201).json(meta);
   } catch (err) {
+    uploadSessions.delete(uploadId);
     cleanupUpload(uploadId);
     try { deleteFile(fileId); } catch { /* ignore */ }
     req.log.error({ err }, "Finalise failed");
@@ -694,6 +742,10 @@ router.post("/files/:fileId/unlock", unlockLimiter, async (req, res): Promise<vo
   }
   if (!req.session.unlockedFiles.includes(fileId)) {
     req.session.unlockedFiles.push(fileId);
+    // SEC: cap the array to prevent unbounded session growth
+    if (req.session.unlockedFiles.length > MAX_UNLOCKED_FILES) {
+      req.session.unlockedFiles = req.session.unlockedFiles.slice(-MAX_UNLOCKED_FILES);
+    }
   }
 
   req.log.info({ fileId }, "File unlocked via password");
@@ -827,7 +879,9 @@ router.get("/files/:fileId/download", downloadLimiter, async (req, res): Promise
   }
 
   const safeName = encodeURIComponent(meta.name).replace(/'/g, "%27");
-  res.setHeader("Content-Type", meta.mimeType || "application/octet-stream");
+  // SEC-MIME: re-sanitize at serve time to protect against any pre-existing
+  // files stored with dangerous MIME types before this fix was applied.
+  res.setHeader("Content-Type", sanitizeMimeType(meta.mimeType || "application/octet-stream"));
   res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${safeName}`);
   res.setHeader("Content-Length", meta.size);
   res.setHeader("Cache-Control", "no-cache");

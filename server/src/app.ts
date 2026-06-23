@@ -42,9 +42,15 @@ app.use(
 if (process.env["NODE_ENV"] === "production" && !process.env["ALLOWED_ORIGINS"]) {
   throw new Error("ALLOWED_ORIGINS environment variable is required in production");
 }
-const allowedOrigins: string[] | true = process.env["ALLOWED_ORIGINS"]
+// SEC: even in dev, never open CORS to all origins — enumerate localhost ports
+const allowedOrigins: string[] = process.env["ALLOWED_ORIGINS"]
   ? process.env["ALLOWED_ORIGINS"].split(",").map((o) => o.trim())
-  : true;
+  : [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://127.0.0.1:3000",
+      "http://127.0.0.1:5173",
+    ];
 
 app.use(
   cors({

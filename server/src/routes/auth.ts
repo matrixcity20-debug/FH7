@@ -43,7 +43,9 @@ router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
   const trimmedUsername = username.trim();
 
   if (await usernameExists(trimmedUsername)) {
-    res.status(409).json({ error: "Bu kullanıcı adı zaten kullanılıyor" });
+    // SEC-enum: prevent username enumeration — return a generic success-shaped
+    // response so an attacker cannot distinguish "taken" from "registered".
+    res.status(201).json({ message: "Kayıt tamamlandı. Giriş yapmayı deneyin." });
     return;
   }
 
@@ -62,7 +64,7 @@ router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
     res.status(201).json({ id: user.id, username: user.username });
   } catch (err) {
     if (err instanceof Error && err.message === "USERNAME_TAKEN") {
-      res.status(409).json({ error: "Bu kullanıcı adı zaten kullanılıyor" });
+      res.status(201).json({ message: "Kayıt tamamlandı. Giriş yapmayı deneyin." });
       return;
     }
     req.log.error({ err }, "Register failed");
