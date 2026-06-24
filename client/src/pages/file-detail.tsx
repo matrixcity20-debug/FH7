@@ -3,7 +3,7 @@ import { useParams, useLocation } from "wouter";
 import {
   Copy, Download, Trash2, Terminal, ArrowLeft, Layers,
   FileCode2, Check, Link2, Clock, Loader2, GitBranch, Plus,
-  Lock, Eye, EyeOff, Shield, LogIn, KeyRound,
+  Lock, Eye, EyeOff, Shield, LogIn, KeyRound, Flag, User,
 } from "lucide-react";
 import { format, formatDistanceToNow } from "date-fns";
 import { tr } from "date-fns/locale";
@@ -12,6 +12,15 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Progress } from "@/components/ui/progress";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { toast } from "@/hooks/use-toast";
 import { Link } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
@@ -32,6 +41,7 @@ interface FileMeta {
   isOwner: boolean;
   requireLogin: boolean;
   hasPassword: boolean;
+  uploaderUsername?: string;
 }
 
 interface AccessError {
@@ -143,6 +153,11 @@ export default function FileDetailPage() {
   const [showSettingsPw, setShowSettingsPw] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
 
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportReason, setReportReason] = useState("");
+  const [reporting, setReporting] = useState(false);
+  const [reportSent, setReportSent] = useState(false);
+
   const loadFile = (id: string) => {
     setLoading(true);
     setAccessError(null);
@@ -242,6 +257,35 @@ export default function FileDetailPage() {
     const res = await fetch(`/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
     if (res.ok) { toast({ title: "Dosya silindi" }); setLocation("/files"); }
     else toast({ variant: "destructive", title: "Silme başarısız" });
+  };
+
+  const reportFile = async () => {
+    if (!fileId || !reportReason.trim()) return;
+    if (reportReason.trim().length < 10) {
+      toast({ variant: "destructive", title: "Şikayet nedeni en az 10 karakter olmalıdır" });
+      return;
+    }
+    setReporting(true);
+    try {
+      const res = await fetch(`/api/files/${fileId}/report`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ reason: reportReason.trim() }),
+      });
+      const data = await res.json() as { ok?: boolean; message?: string; error?: string };
+      if (res.ok && data.ok) {
+        setReportSent(true);
+        setReportReason("");
+        toast({ title: "Şikayet gönderildi", description: data.message });
+      } else {
+        toast({ variant: "destructive", title: data.error ?? "Şikayet gönderilemedi" });
+      }
+    } catch {
+      toast({ variant: "destructive", title: "Bağlantı hatası" });
+    } finally {
+      setReporting(false);
+    }
   };
 
   const copy = async (text: string, type: "snippet" | "link" | "directLink") => {
@@ -374,6 +418,15 @@ export default function FileDetailPage() {
               <span className="text-xs text-muted-foreground font-mono">{formatBytes(file.size)}</span>
               <span className="text-muted-foreground/30 text-xs">·</span>
               <span className="text-xs text-muted-foreground">{format(new Date(file.uploadedAt), "d MMM yyyy HH:mm", { locale: tr })}</span>
+              {file.uploaderUsername && (
+                <>
+                  <span className="text-muted-foreground/30 text-xs">·</span>
+                  <span className="flex items-center gap-1 text-xs text-muted-foreground font-mono">
+                    <User className="w-3 h-3" />
+                    {file.uploaderUsername}
+                  </span>
+                </>
+              )}
               {file.expiresAt && (
                 <>
                   <span className="text-muted-foreground/30 text-xs">·</span>
@@ -401,6 +454,16 @@ export default function FileDetailPage() {
               <Download className="w-3.5 h-3.5" /> İndir
             </Button>
           </a>
+          {!file.isOwner && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-2 text-xs font-mono border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+              onClick={() => { setReportSent(false); setReportOpen(true); }}
+            >
+              <Flag className="w-3.5 h-3.5" /> Şikayet Et
+            </Button>
+          )}
           {file.isOwner && (
             <Button size="sm" variant="destructive" className="gap-2 text-xs font-mono" onClick={deleteFile}>
               <Trash2 className="w-3.5 h-3.5" /> Sil
@@ -600,6 +663,79 @@ export default function FileDetailPage() {
           )}
         </div>
       </div>
+
+      {/* ── Şikayet Dialogu ───────────────────────────────────────────── */}
+      <Dialog open={reportOpen} onOpenChange={(open) => { setReportOpen(open); if (!open) { setReportSent(false); setReportReason(""); } }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="font-mono flex items-center gap-2">
+              <Flag className="w-4 h-4 text-destructive" />
+              Dosyayı Şikayet Et
+            </DialogTitle>
+            <DialogDescription className="text-xs">
+              {file?.uploaderUsername && (
+                <span className="block mb-1 font-mono text-muted-foreground">
+                  Paylaşan: <span className="text-foreground">{file.uploaderUsername}</span>
+                </span>
+              )}
+              Şikayet nedeninizi açıklayın. Ekibimiz en kısa sürede inceleyecektir.
+            </DialogDescription>
+          </DialogHeader>
+
+          {reportSent ? (
+            <div className="py-6 text-center space-y-3">
+              <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mx-auto">
+                <Check className="w-5 h-5 text-emerald-400" />
+              </div>
+              <p className="text-sm font-mono text-foreground">Şikayetiniz alındı.</p>
+              <p className="text-xs text-muted-foreground">İnceleme ekibimiz değerlendirecek.</p>
+              <Button className="w-full text-xs font-mono mt-2" variant="outline" onClick={() => setReportOpen(false)}>
+                Kapat
+              </Button>
+            </div>
+          ) : (
+            <>
+              <div className="space-y-3 py-2">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-mono text-muted-foreground">Şikayet Nedeni</label>
+                  <Textarea
+                    placeholder="Dosyanın neden uygunsuz veya kurallara aykırı olduğunu açıklayın... (en az 10 karakter)"
+                    value={reportReason}
+                    onChange={(e) => setReportReason(e.target.value)}
+                    className="font-mono text-xs resize-none min-h-[120px]"
+                    maxLength={1000}
+                    disabled={reporting}
+                    autoFocus
+                  />
+                  <p className="text-[11px] text-muted-foreground text-right font-mono">
+                    {reportReason.length} / 1000
+                  </p>
+                </div>
+              </div>
+              <DialogFooter className="gap-2 sm:gap-0">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs font-mono"
+                  onClick={() => setReportOpen(false)}
+                  disabled={reporting}
+                >
+                  İptal
+                </Button>
+                <Button
+                  size="sm"
+                  className="gap-2 text-xs font-mono bg-destructive hover:bg-destructive/90"
+                  onClick={reportFile}
+                  disabled={reporting || reportReason.trim().length < 10}
+                >
+                  {reporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Flag className="w-3.5 h-3.5" />}
+                  {reporting ? "Gönderiliyor..." : "Şikayeti Gönder"}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

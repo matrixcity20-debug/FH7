@@ -38,7 +38,8 @@ import {
   isValidFolderId,
   type FolderMeta,
 } from "../lib/fileStore.js";
-import { getUserLimits } from "../lib/userStore.js";
+import { getUserLimits, findUserById } from "../lib/userStore.js";
+import { getFirebaseDb } from "../lib/firebase.js";
 import {
   getSession,
   setSession,
@@ -186,18 +187,31 @@ function canAccess(
   return { ok: true };
 }
 
-function buildPublicMeta(meta: FileMeta, req: Request) {
+async function buildPublicMeta(meta: FileMeta, req: Request) {
   // SEC: strip userId, passwordHash, and sha256 from the public shape.
   // sha256 is only surfaced back to the owner — it is not needed by other
   // downloaders and leaking it needlessly increases the attack surface for
   // any future hash-based exploitation primitives.
   const { userId: _u, passwordHash: _p, sha256: _hash, ...rest } = meta;
   const isOwner = !!req.session.userId && meta.userId === req.session.userId;
+
+  // Look up uploader's username to display on the file page (never expose userId).
+  let uploaderUsername: string | undefined;
+  if (meta.userId) {
+    try {
+      const uploader = await findUserById(meta.userId);
+      uploaderUsername = uploader?.username;
+    } catch {
+      // non-fatal — username just won't appear
+    }
+  }
+
   return {
     ...rest,
     isOwner,
     requireLogin: !!meta.requireLogin,
     hasPassword: !!meta.passwordHash,
+    uploaderUsername,
     ...(isOwner && meta.sha256 ? { sha256: meta.sha256 } : {}),
   };
 }
@@ -765,7 +779,7 @@ router.get("/files/:fileId", async (req, res): Promise<void> => {
     return;
   }
 
-  res.json(buildPublicMeta(meta, req));
+  res.json(await buildPublicMeta(meta, req));
 });
 
 router.post("/files/:fileId/unlock", unlockLimiter, async (req, res): Promise<void> => {
@@ -861,7 +875,7 @@ router.patch("/files/:fileId/settings", requireAuth, async (req, res): Promise<v
     { fileId, requireLogin: meta.requireLogin, hasPassword: !!meta.passwordHash },
     "File access settings updated",
   );
-  res.json(buildPublicMeta(meta, req));
+  res.json(await buildPublicMeta(meta, req));
 });
 
 router.delete("/files/:fileId", requireAuth, async (req, res): Promise<void> => {
@@ -1016,5 +1030,93 @@ router.get(
     res.sendFile(chunkPath);
   },
 );
+
+// ── Dosya Şikayet Endpoint'i ────────────────────────────────────────────────
+// Rate limit: IP başına 15 dakikada en fazla 5 şikayet
+const reportLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla şikayet gönderildi. Lütfen 15 dakika bekleyin." },
+  keyGenerator: (req: Request) => req.ip ?? "unknown",
+});
+
+router.post("/files/:fileId/report", reportLimiter, async (req, res): Promise<void> => {
+  const { fileId } = req.params;
+  if (!fileId || !isValidFileId(fileId)) {
+    res.status(400).json({ error: "Geçersiz dosya ID'si" });
+    return;
+  }
+
+  const meta = readMeta(fileId);
+  if (!meta) {
+    res.status(404).json({ error: "Dosya bulunamadı" });
+    return;
+  }
+  if (isFileExpired(meta)) {
+    res.status(410).json({ error: "Dosyanın süresi doldu" });
+    return;
+  }
+
+  const { reason } = req.body as { reason?: unknown };
+  if (!reason || typeof reason !== "string" || reason.trim().length < 10) {
+    res.status(400).json({ error: "Şikayet nedeni en az 10 karakter olmalıdır" });
+    return;
+  }
+  if (reason.trim().length > 1000) {
+    res.status(400).json({ error: "Şikayet nedeni en fazla 1000 karakter olabilir" });
+    return;
+  }
+
+  // Paylaşan kullanıcı bilgilerini al (şifre hash'i dahil edilmez — ASLA)
+  const uploaderUser = meta.userId ? await findUserById(meta.userId) : null;
+
+  // Şikayet edenin kimliği (giriş yapıyorsa kullanıcı adı, yoksa misafir)
+  const reporterUser = req.session.userId ? await findUserById(req.session.userId) : null;
+
+  // Gerçek IP: proxy arkasında da doğru alınır
+  const rawIp =
+    (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim() ??
+    req.ip ??
+    "bilinmiyor";
+
+  const { v4: newUuid } = await import("uuid");
+  const reportId = newUuid();
+
+  const report = {
+    reportId,
+    dosyaLinki: `${getBaseUrl(req)}/files/${fileId}`,
+    dosyaId: fileId,
+    dosyaAdi: meta.name,
+    yukleyenKullanici: uploaderUser?.username ?? "bilinmiyor",
+    yukleyenKullaniciId: meta.userId ?? "bilinmiyor",
+    sikayetNedeni: reason.trim(),
+    sikayetEdenIp: rawIp,
+    sikayetEdenKullanici: reporterUser?.username ?? "misafir",
+    tarih: new Date().toISOString(),
+  };
+
+  const db = getFirebaseDb();
+  if (db) {
+    await db.ref(`sikayetEdilen_dosyalar/${reportId}`).set(report);
+  } else {
+    // Firebase yapılandırılmamışsa yerel dosyaya kaydet
+    const reportsPath = path.join(uploadsDir, "_reports.json");
+    let reports: unknown[] = [];
+    if (fs.existsSync(reportsPath)) {
+      try {
+        reports = JSON.parse(fs.readFileSync(reportsPath, "utf-8")) as unknown[];
+      } catch {
+        reports = [];
+      }
+    }
+    reports.push(report);
+    fs.writeFileSync(reportsPath, JSON.stringify(reports, null, 2));
+  }
+
+  req.log.info({ fileId, reportId }, "File reported");
+  res.json({ ok: true, message: "Şikayetiniz alındı. İnceleme ekibimiz değerlendirecek." });
+});
 
 export default router;

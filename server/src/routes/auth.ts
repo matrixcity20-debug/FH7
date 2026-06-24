@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
-import { findUserByUsername, createUser, usernameExists, findUserById } from "../lib/userStore.js";
+import { findUserByUsername, createUser, usernameExists, findUserById, updateLastLogin } from "../lib/userStore.js";
 
 declare module "express-session" {
   interface SessionData {
@@ -100,6 +100,10 @@ router.post("/auth/login", authLimiter, async (req, res): Promise<void> => {
     req.session.regenerate((err) => (err ? reject(err) : resolve()));
   });
   req.session.userId = user.id;
+
+  // lastLoginAt güncellemesi — fire-and-forget, login akışını bloklamaz
+  updateLastLogin(user.id).catch(() => {});
+
   req.log.info({ userId: user.id }, "User logged in");
   res.json({ id: user.id, username: user.username });
 });

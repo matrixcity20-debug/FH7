@@ -25,6 +25,7 @@ export interface User {
   username: string;
   passwordHash: string;
   createdAt: string;
+  lastLoginAt?: string;
   limits?: UserLimits;
 }
 
@@ -395,6 +396,41 @@ export async function resetUserLimits(userId: string): Promise<void> {
     }
   }
   setLimitsLocal(userId, {});
+}
+
+// ---------------------------------------------------------------------------
+// Son Giriş Zamanı Güncelleme
+// ---------------------------------------------------------------------------
+
+/**
+ * Başarılı girişten sonra kullanıcının lastLoginAt alanını günceller.
+ * Hata durumunda sessizce devam eder — kritik değil, loglama yeterli.
+ */
+export async function updateLastLogin(userId: string): Promise<void> {
+  const now = new Date().toISOString();
+
+  if (getFirebaseDb()) {
+    try {
+      const db = getFirebaseDb()!;
+      await db.ref(`users/${userId}/lastLoginAt`).set(now);
+      return;
+    } catch (err) {
+      logger.error({ err, userId }, "Firebase updateLastLogin error, falling back to local");
+    }
+  }
+
+  // Yerel fallback
+  try {
+    const p = getUsersFilePath();
+    const users = loadLocalUsers();
+    const idx = users.findIndex((u) => u.id === userId);
+    if (idx !== -1) {
+      users[idx] = { ...users[idx]!, lastLoginAt: now };
+      saveLocalUsers(users);
+    }
+  } catch (err) {
+    logger.error({ err, userId }, "Local updateLastLogin error");
+  }
 }
 
 /**

@@ -2,11 +2,13 @@ import { useState, useEffect } from "react";
 import {
   Users, Settings, RefreshCw, CheckCircle, AlertCircle,
   RotateCcw, ChevronDown, ChevronUp, Database, UploadCloud, Layers,
-  Shield,
+  Shield, Flag, Trash2, ExternalLink, XCircle, AlertTriangle, FileText,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/use-auth";
+import { format, formatDistanceToNow } from "date-fns";
+import { tr } from "date-fns/locale";
 
 function formatBytes(bytes: number, decimals = 1): string {
   if (!+bytes) return "0 B";
@@ -30,6 +32,7 @@ interface AdminUser {
   id: string;
   username: string;
   createdAt: string;
+  lastLoginAt: string | null;
   usedBytes: number;
   limits: ResolvedLimits;
   customLimits: {
@@ -50,6 +53,21 @@ interface EditState {
   maxFileSizeMB: string;
 }
 
+interface FileReport {
+  reportId: string;
+  dosyaLinki: string;
+  dosyaId: string;
+  dosyaAdi: string;
+  yukleyenKullanici: string;
+  yukleyenKullaniciId: string;
+  sikayetNedeni: string;
+  sikayetEdenIp: string;
+  sikayetEdenKullanici: string;
+  tarih: string;
+}
+
+type Tab = "users" | "reports";
+
 function StorageBar({ used, total }: { used: number; total: number }) {
   const pct = Math.min(100, (used / Math.max(1, total)) * 100);
   const color = pct >= 95 ? "bg-destructive" : pct >= 80 ? "bg-amber-500" : "bg-primary";
@@ -64,6 +82,24 @@ function StorageBar({ used, total }: { used: number; total: number }) {
       </div>
     </div>
   );
+}
+
+function formatDate(iso: string | null | undefined, fallback = "—"): string {
+  if (!iso) return fallback;
+  try {
+    return format(new Date(iso), "d MMM yyyy, HH:mm", { locale: tr });
+  } catch {
+    return fallback;
+  }
+}
+
+function formatRelative(iso: string | null | undefined, fallback = "Hiç giriş yapılmamış"): string {
+  if (!iso) return fallback;
+  try {
+    return formatDistanceToNow(new Date(iso), { addSuffix: true, locale: tr });
+  } catch {
+    return fallback;
+  }
 }
 
 function UserRow({
@@ -165,6 +201,20 @@ function UserRow({
 
       {expanded && (
         <div className="border-t border-border/40 p-4 space-y-4 bg-muted/5">
+          <div className="grid grid-cols-2 gap-2">
+            <div className="px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
+              <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-0.5">Kayıt Tarihi</p>
+              <p className="text-xs font-mono text-foreground font-medium">{formatDate(user.createdAt)}</p>
+            </div>
+            <div className="px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
+              <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-0.5">Son Giriş</p>
+              <p className="text-xs font-mono text-foreground font-medium">{formatRelative(user.lastLoginAt)}</p>
+              {user.lastLoginAt && (
+                <p className="text-[10px] font-mono text-muted-foreground">{formatDate(user.lastLoginAt)}</p>
+              )}
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-1.5">
               <label className="text-xs font-mono text-muted-foreground flex items-center gap-1.5">
@@ -230,14 +280,149 @@ function UserRow({
   );
 }
 
+function ReportCard({
+  report,
+  onDismiss,
+  onDeleteFile,
+}: {
+  report: FileReport;
+  onDismiss: (reportId: string) => Promise<void>;
+  onDeleteFile: (reportId: string) => Promise<void>;
+}) {
+  const [dismissing, setDismissing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const handleDismiss = async () => {
+    setDismissing(true);
+    try { await onDismiss(report.reportId); }
+    finally { setDismissing(false); }
+  };
+
+  const handleDeleteFile = async () => {
+    if (!confirmDelete) { setConfirmDelete(true); return; }
+    setDeleting(true);
+    try { await onDeleteFile(report.reportId); }
+    finally { setDeleting(false); setConfirmDelete(false); }
+  };
+
+  return (
+    <div className="rounded-xl border border-border/60 bg-card/60 overflow-hidden">
+      <div className="p-4 space-y-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-destructive/10 border border-destructive/20 flex items-center justify-center shrink-0">
+              <Flag className="w-3.5 h-3.5 text-destructive" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-mono font-semibold text-foreground truncate max-w-xs">
+                {report.dosyaAdi}
+              </p>
+              <p className="text-[10px] font-mono text-muted-foreground">
+                {format(new Date(report.tarih), "d MMM yyyy, HH:mm", { locale: tr })}
+              </p>
+            </div>
+          </div>
+          <a
+            href={report.dosyaLinki}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="shrink-0"
+          >
+            <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-primary">
+              <ExternalLink className="w-3.5 h-3.5" />
+            </Button>
+          </a>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+          <div className="px-3 py-2 rounded-lg bg-muted/30 border border-border/40 space-y-0.5">
+            <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Paylaşan</p>
+            <p className="text-foreground font-semibold">{report.yukleyenKullanici}</p>
+          </div>
+          <div className="px-3 py-2 rounded-lg bg-muted/30 border border-border/40 space-y-0.5">
+            <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Şikayet Eden</p>
+            <p className="text-foreground font-semibold">{report.sikayetEdenKullanici}</p>
+          </div>
+          <div className="px-3 py-2 rounded-lg bg-muted/30 border border-border/40 space-y-0.5 sm:col-span-2">
+            <p className="text-[10px] text-muted-foreground uppercase tracking-wider">IP Adresi</p>
+            <p className="text-foreground">{report.sikayetEdenIp}</p>
+          </div>
+        </div>
+
+        <div className="px-3 py-2.5 rounded-lg bg-destructive/5 border border-destructive/20">
+          <p className="text-[10px] font-mono text-destructive/70 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+            <FileText className="w-3 h-3" /> Şikayet Nedeni
+          </p>
+          <p className="text-xs font-mono text-foreground leading-relaxed whitespace-pre-wrap break-words">
+            {report.sikayetNedeni}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 pt-1 justify-end">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs font-mono text-muted-foreground gap-1.5 hover:text-foreground"
+            disabled={dismissing || deleting}
+            onClick={handleDismiss}
+          >
+            {dismissing
+              ? <RefreshCw className="w-3 h-3 animate-spin" />
+              : <XCircle className="w-3 h-3" />}
+            {dismissing ? "Kapatılıyor…" : "Şikayeti Kapat"}
+          </Button>
+
+          {confirmDelete ? (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] font-mono text-destructive">Emin misiniz?</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-xs font-mono text-muted-foreground gap-1 h-7 px-2"
+                onClick={() => setConfirmDelete(false)}
+                disabled={deleting}
+              >
+                İptal
+              </Button>
+              <Button
+                size="sm"
+                className="text-xs font-mono gap-1.5 h-7 bg-destructive hover:bg-destructive/90"
+                disabled={deleting}
+                onClick={handleDeleteFile}
+              >
+                {deleting ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                {deleting ? "Siliniyor…" : "Evet, Sil"}
+              </Button>
+            </div>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-xs font-mono gap-1.5 border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+              disabled={dismissing || deleting}
+              onClick={handleDeleteFile}
+            >
+              <Trash2 className="w-3 h-3" /> Dosyayı Sil
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function AdminPage() {
   const { user } = useAuth();
+  const [activeTab, setActiveTab] = useState<Tab>("users");
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [defaults, setDefaults] = useState<ServerDefaults | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [reports, setReports] = useState<FileReport[]>([]);
+  const [reportsLoading, setReportsLoading] = useState(false);
 
-  const loadData = async (silent = false) => {
+  const loadUsers = async (silent = false) => {
     if (!silent) setLoading(true);
     else setRefreshing(true);
     try {
@@ -248,14 +433,35 @@ export default function AdminPage() {
       if (usersRes.ok) setUsers(await usersRes.json() as AdminUser[]);
       if (defaultsRes.ok) setDefaults(await defaultsRes.json() as ServerDefaults);
     } catch {
-      toast({ variant: "destructive", title: "Veriler yüklenemedi" });
+      toast({ variant: "destructive", title: "Kullanıcı verileri yüklenemedi" });
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
   };
 
-  useEffect(() => { void loadData(); }, []);
+  const loadReports = async (silent = false) => {
+    if (!silent) setReportsLoading(true);
+    try {
+      const res = await fetch("/api/admin/reports", { credentials: "include" });
+      if (res.ok) setReports(await res.json() as FileReport[]);
+      else toast({ variant: "destructive", title: "Şikayetler yüklenemedi" });
+    } catch {
+      toast({ variant: "destructive", title: "Şikayetler yüklenemedi" });
+    } finally {
+      setReportsLoading(false);
+    }
+  };
+
+  const loadAll = async (silent = false) => {
+    if (!silent) { setLoading(true); setReportsLoading(true); }
+    else setRefreshing(true);
+    await Promise.all([loadUsers(true), loadReports(true)]);
+    if (!silent) { setLoading(false); setReportsLoading(false); }
+    else setRefreshing(false);
+  };
+
+  useEffect(() => { void loadAll(); }, []);
 
   const handleSave = async (userId: string, limits: { storageQuotaBytes?: number; maxFileSizeBytes?: number }) => {
     const res = await fetch(`/api/admin/users/${userId}/limits`, {
@@ -270,7 +476,7 @@ export default function AdminPage() {
       return;
     }
     toast({ title: "Limitler güncellendi ✓" });
-    await loadData(true);
+    await loadUsers(true);
   };
 
   const handleReset = async (userId: string) => {
@@ -283,7 +489,37 @@ export default function AdminPage() {
       return;
     }
     toast({ title: "Limitler varsayılana döndürüldü" });
-    await loadData(true);
+    await loadUsers(true);
+  };
+
+  const handleDismissReport = async (reportId: string) => {
+    const res = await fetch(`/api/admin/reports/${reportId}`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+    if (!res.ok) {
+      const err = await res.json() as { error?: string };
+      toast({ variant: "destructive", title: err.error ?? "Şikayet kapatılamadı" });
+      return;
+    }
+    toast({ title: "Şikayet kapatıldı" });
+    setReports((prev) => prev.filter((r) => r.reportId !== reportId));
+  };
+
+  const handleDeleteReportedFile = async (reportId: string) => {
+    const res = await fetch(`/api/admin/reports/${reportId}/file`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+    const data = await res.json() as { ok?: boolean; fileDeleted?: boolean; error?: string };
+    if (!res.ok) {
+      toast({ variant: "destructive", title: data.error ?? "İşlem başarısız" });
+      return;
+    }
+    toast({
+      title: data.fileDeleted ? "Dosya silindi ve şikayet kapatıldı ✓" : "Şikayet kapatıldı (dosya zaten silinmişti)",
+    });
+    setReports((prev) => prev.filter((r) => r.reportId !== reportId));
   };
 
   if (!user?.isAdmin) {
@@ -307,14 +543,14 @@ export default function AdminPage() {
             </div>
             <h1 className="text-2xl font-bold font-mono gradient-text">Yönetici Paneli</h1>
           </div>
-          <p className="text-muted-foreground text-sm">Kullanıcı depolama ve limit yönetimi</p>
+          <p className="text-muted-foreground text-sm">Platform yönetimi ve içerik denetimi</p>
         </div>
         <Button
           variant="outline"
           size="sm"
           className="gap-2 text-xs font-mono"
           disabled={refreshing}
-          onClick={() => loadData(true)}
+          onClick={() => loadAll(true)}
         >
           <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? "animate-spin" : ""}`} />
           Yenile
@@ -341,36 +577,119 @@ export default function AdminPage() {
         </div>
       )}
 
-      <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground">
-        <Users className="w-3.5 h-3.5" />
-        <span>{users.length} kullanıcı</span>
-        <Settings className="w-3.5 h-3.5 ml-2" />
-        <span>Limitleri değiştirmek için kullanıcıya tıklayın</span>
+      <div className="flex gap-1 p-1 rounded-xl bg-muted/40 border border-border/60 w-fit">
+        <button
+          onClick={() => setActiveTab("users")}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-mono transition-all ${
+            activeTab === "users"
+              ? "bg-card border border-border/60 text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <Users className="w-3.5 h-3.5" />
+          Kullanıcılar
+          <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${activeTab === "users" ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`}>
+            {users.length}
+          </span>
+        </button>
+        <button
+          onClick={() => setActiveTab("reports")}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-mono transition-all ${
+            activeTab === "reports"
+              ? "bg-card border border-border/60 text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <Flag className="w-3.5 h-3.5" />
+          Şikayetler
+          {reports.length > 0 && (
+            <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
+              activeTab === "reports"
+                ? "bg-destructive/10 text-destructive"
+                : "bg-destructive/20 text-destructive animate-pulse"
+            }`}>
+              {reports.length}
+            </span>
+          )}
+        </button>
       </div>
 
-      {loading ? (
-        <div className="space-y-2">
-          {[...Array(4)].map((_, i) => (
-            <div key={i} className="h-16 rounded-xl border border-border bg-card/60 animate-pulse" />
-          ))}
-        </div>
-      ) : users.length === 0 ? (
-        <div className="text-center py-16 border border-dashed border-border/40 rounded-xl">
-          <Users className="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
-          <p className="text-sm text-muted-foreground font-mono">Henüz kayıtlı kullanıcı yok</p>
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {users.map((u) => (
-            <UserRow
-              key={u.id}
-              user={u}
-              defaults={defaults ?? { storageQuotaBytes: 5368709120, maxFileSizeBytes: 524288000, chunkSizeBytes: 1048576 }}
-              onSave={handleSave}
-              onReset={handleReset}
-            />
-          ))}
-        </div>
+      {activeTab === "users" && (
+        <>
+          <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground">
+            <Users className="w-3.5 h-3.5" />
+            <span>{users.length} kullanıcı</span>
+            <Settings className="w-3.5 h-3.5 ml-2" />
+            <span>Limitleri değiştirmek için kullanıcıya tıklayın</span>
+          </div>
+
+          {loading ? (
+            <div className="space-y-2">
+              {[...Array(4)].map((_, i) => (
+                <div key={i} className="h-16 rounded-xl border border-border bg-card/60 animate-pulse" />
+              ))}
+            </div>
+          ) : users.length === 0 ? (
+            <div className="text-center py-16 border border-dashed border-border/40 rounded-xl">
+              <Users className="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
+              <p className="text-sm text-muted-foreground font-mono">Henüz kayıtlı kullanıcı yok</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {users.map((u) => (
+                <UserRow
+                  key={u.id}
+                  user={u}
+                  defaults={defaults ?? { storageQuotaBytes: 5368709120, maxFileSizeBytes: 524288000, chunkSizeBytes: 1048576 }}
+                  onSave={handleSave}
+                  onReset={handleReset}
+                />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {activeTab === "reports" && (
+        <>
+          <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground">
+            <Flag className="w-3.5 h-3.5" />
+            <span>{reports.length} açık şikayet</span>
+            {reports.length > 0 && (
+              <>
+                <AlertTriangle className="w-3.5 h-3.5 ml-2 text-amber-400" />
+                <span className="text-amber-400">İnceleme bekliyor</span>
+              </>
+            )}
+          </div>
+
+          {reportsLoading ? (
+            <div className="space-y-2">
+              {[...Array(3)].map((_, i) => (
+                <div key={i} className="h-48 rounded-xl border border-border bg-card/60 animate-pulse" />
+              ))}
+            </div>
+          ) : reports.length === 0 ? (
+            <div className="text-center py-16 border border-dashed border-border/40 rounded-xl">
+              <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mx-auto mb-3">
+                <CheckCircle className="w-5 h-5 text-emerald-400" />
+              </div>
+              <p className="text-sm text-muted-foreground font-mono">Açık şikayet yok</p>
+              <p className="text-xs text-muted-foreground/60 font-mono mt-1">Tüm şikayetler incelendi.</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {reports.map((r) => (
+                <ReportCard
+                  key={r.reportId}
+                  report={r}
+                  onDismiss={handleDismissReport}
+                  onDeleteFile={handleDeleteReportedFile}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );

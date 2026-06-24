@@ -1,5 +1,7 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import rateLimit from "express-rate-limit";
+import fs from "fs";
+import path from "path";
 import {
   findUserById,
   getUserLimits,
@@ -8,7 +10,17 @@ import {
   listAllUsersPublic,
   type UserLimits,
 } from "../lib/userStore.js";
-import { getUserStorageUsed, MAX_USER_STORAGE_BYTES, MAX_FILE_SIZE, CHUNK_SIZE } from "../lib/fileStore.js";
+import {
+  getUserStorageUsed,
+  MAX_USER_STORAGE_BYTES,
+  MAX_FILE_SIZE,
+  CHUNK_SIZE,
+  deleteFile,
+  readMeta,
+  isValidFileId,
+  uploadsDir,
+} from "../lib/fileStore.js";
+import { getFirebaseDb } from "../lib/firebase.js";
 
 const router: IRouter = Router();
 
@@ -120,9 +132,10 @@ router.get("/admin/users", requireAdmin, adminLimiter, async (req, res): Promise
         const limits   = await getUserLimits(u.id);
         const usedBytes = getUserStorageUsed(u.id);
         return {
-          id:        u.id,
-          username:  u.username,
-          createdAt: u.createdAt,
+          id:          u.id,
+          username:    u.username,
+          createdAt:   u.createdAt,
+          lastLoginAt: u.lastLoginAt ?? null,
           usedBytes,
           limits,
           customLimits: u.limits ?? null,
@@ -203,6 +216,154 @@ router.get("/admin/defaults", requireAdmin, adminLimiter, (_req, res): void => {
     maxFileSizeBytes:  MAX_FILE_SIZE,
     chunkSizeBytes:    CHUNK_SIZE,
   });
+});
+
+// ── Şikayet (Report) Yönetimi ──────────────────────────────────────────────
+
+export interface FileReport {
+  reportId: string;
+  dosyaLinki: string;
+  dosyaId: string;
+  dosyaAdi: string;
+  yukleyenKullanici: string;
+  yukleyenKullaniciId: string;
+  sikayetNedeni: string;
+  sikayetEdenIp: string;
+  sikayetEdenKullanici: string;
+  tarih: string;
+}
+
+function getLocalReportsPath(): string {
+  return path.join(uploadsDir, "_reports.json");
+}
+
+async function listAllReports(): Promise<FileReport[]> {
+  const db = getFirebaseDb();
+  if (db) {
+    try {
+      const snap = await db.ref("sikayetEdilen_dosyalar").get();
+      if (!snap.exists()) return [];
+      const reports: FileReport[] = [];
+      snap.forEach((child) => {
+        reports.push(child.val() as FileReport);
+      });
+      return reports.sort((a, b) => new Date(b.tarih).getTime() - new Date(a.tarih).getTime());
+    } catch (err) {
+      throw new Error(`Firebase okuma hatası: ${String(err)}`);
+    }
+  }
+  // Yerel fallback
+  const p = getLocalReportsPath();
+  if (!fs.existsSync(p)) return [];
+  try {
+    const all = JSON.parse(fs.readFileSync(p, "utf-8")) as FileReport[];
+    return all.sort((a, b) => new Date(b.tarih).getTime() - new Date(a.tarih).getTime());
+  } catch {
+    return [];
+  }
+}
+
+async function removeReport(reportId: string): Promise<void> {
+  const db = getFirebaseDb();
+  if (db) {
+    await db.ref(`sikayetEdilen_dosyalar/${reportId}`).remove();
+    return;
+  }
+  // Yerel fallback
+  const p = getLocalReportsPath();
+  if (!fs.existsSync(p)) return;
+  try {
+    const all = JSON.parse(fs.readFileSync(p, "utf-8")) as FileReport[];
+    const filtered = all.filter((r) => r.reportId !== reportId);
+    fs.writeFileSync(p, JSON.stringify(filtered, null, 2));
+  } catch {
+    // ignore
+  }
+}
+
+// ── GET /api/admin/reports ─────────────────────────────────────────────────
+router.get("/admin/reports", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  try {
+    const reports = await listAllReports();
+    res.json(reports);
+  } catch (err) {
+    req.log.error({ err }, "Admin listReports error");
+    res.status(500).json({ error: "Şikayet listesi alınamadı" });
+  }
+});
+
+// ── DELETE /api/admin/reports/:reportId ───────────────────────────────────
+// Sadece şikayeti kapat (dosyayı silme)
+router.delete("/admin/reports/:reportId", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  const { reportId } = req.params;
+  if (!reportId || typeof reportId !== "string" || reportId.length > 128) {
+    res.status(400).json({ error: "Geçersiz reportId" });
+    return;
+  }
+  try {
+    await removeReport(reportId);
+    req.log.info({ adminId: req.session.userId, reportId }, "Admin dismissed report");
+    res.json({ ok: true });
+  } catch (err) {
+    req.log.error({ err }, "Admin dismissReport error");
+    res.status(500).json({ error: "Şikayet kapatılamadı" });
+  }
+});
+
+// ── DELETE /api/admin/reports/:reportId/file ──────────────────────────────
+// Hem şikayeti kapat hem de ilgili dosyayı sil
+router.delete("/admin/reports/:reportId/file", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  const { reportId } = req.params;
+  if (!reportId || typeof reportId !== "string" || reportId.length > 128) {
+    res.status(400).json({ error: "Geçersiz reportId" });
+    return;
+  }
+
+  let fileId: string | undefined;
+  try {
+    // Önce rapordan dosya ID'sini öğren
+    const reports = await listAllReports();
+    const report = reports.find((r) => r.reportId === reportId);
+    if (!report) {
+      res.status(404).json({ error: "Şikayet bulunamadı" });
+      return;
+    }
+    fileId = report.dosyaId;
+  } catch (err) {
+    req.log.error({ err }, "Admin deleteReportedFile: list error");
+    res.status(500).json({ error: "Şikayet bilgisi alınamadı" });
+    return;
+  }
+
+  // Dosya ID doğrulama
+  if (!fileId || !isValidFileId(fileId)) {
+    res.status(400).json({ error: "Şikayette geçersiz dosya ID'si" });
+    return;
+  }
+
+  // Dosyayı sil (yoksa sessizce geç)
+  const meta = readMeta(fileId);
+  if (meta) {
+    try {
+      deleteFile(fileId);
+      req.log.info({ adminId: req.session.userId, fileId, reportId }, "Admin deleted reported file");
+    } catch (err) {
+      req.log.error({ err, fileId }, "Admin deleteReportedFile: file delete error");
+      res.status(500).json({ error: "Dosya silinemedi" });
+      return;
+    }
+  }
+
+  // Şikayeti kapat
+  try {
+    await removeReport(reportId);
+  } catch (err) {
+    req.log.error({ err, reportId }, "Admin deleteReportedFile: report remove error");
+    // Dosya zaten silindi, devam et
+  }
+
+  req.log.info({ adminId: req.session.userId, reportId, fileId }, "Admin closed report + deleted file");
+  res.json({ ok: true, fileDeleted: !!meta });
 });
 
 export default router;
