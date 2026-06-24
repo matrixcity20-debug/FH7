@@ -122,14 +122,19 @@ export default function UploadPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // resetState: hata sonrası temizlik için kullanılır.
+  // abort bayrağını temizler çünkü bir sonraki yüklemede temiz başlamak gerekir.
   const resetState = () => {
     abortRef.current = false;
     setUploadStep({ phase: "idle" });
   };
 
+  // cancelUpload: SADECE abort bayrağını set eder ve UI'ı sıfırlar.
+  // resetState() ÇAĞIRMAZ — çünkü resetState abort bayrağını temizler ve
+  // iptal sinyali upload loop'una ulaşamadan sıfırlanırdı.
   const cancelUpload = () => {
     abortRef.current = true;
-    resetState();
+    setUploadStep({ phase: "idle" }); // UI'ı hemen idle'a al
     toast({ title: "Yükleme iptal edildi" });
   };
 
@@ -180,7 +185,17 @@ export default function UploadPage() {
       });
       if (abortRef.current) return;
       if (!initRes.ok) throw new Error(await parseErrorMessage(initRes));
-      const { uploadId } = await initRes.json() as { uploadId: string };
+      const { uploadId, partSize: serverPartSize } = await initRes.json() as { uploadId: string; partSize?: number };
+
+      // Sunucunun döndürdüğü partSize'ı kullan — bu değer Firebase'deki per-user
+      // chunkSizeBytes limitidir. Sunucudan beklenmedik bir değer gelirse (geliştirme
+      // ortamı tutarsızlığı vb.) 1 MB alt sınır ve 100 MB üst sınır arasına kısıtla.
+      const PART_SIZE = (
+        typeof serverPartSize === "number" &&
+        Number.isInteger(serverPartSize) &&
+        serverPartSize >= 512 * 1024 &&      // 512 KB min — makul en küçük parça
+        serverPartSize <= 100 * 1024 * 1024  // 100 MB max — sunucu hard cap ile aynı
+      ) ? serverPartSize : 5 * 1024 * 1024;  // fallback: 5 MB
 
       const totalParts = Math.ceil(file.size / PART_SIZE);
       let bytesDone = 0;

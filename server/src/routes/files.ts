@@ -93,11 +93,12 @@ function sanitizeMimeType(raw: string): string {
 // declared max size (disk-exhaustion DoS guard), and creation time (TTL-based
 // cleanup of abandoned uploads that never reached finalize).
 interface UploadSession {
-  sessionId: string;           // req.sessionID that called upload-init
-  maxBytes: number;            // client-declared file size — upper bound for received bytes
-  receivedBytes: number;       // running total of bytes written to disk across all parts
-  createdAt: number;           // Date.now() at upload-init time — for TTL cleanup
-  userMaxFileSizeBytes: number; // per-user resolved maxFileSizeBytes — for part-level DoS guard
+  sessionId: string;            // req.sessionID that called upload-init
+  maxBytes: number;             // client-declared file size — upper bound for received bytes
+  receivedBytes: number;        // running total of bytes written to disk across all parts
+  createdAt: number;            // Date.now() at upload-init time — for TTL cleanup
+  userMaxFileSizeBytes: number;  // per-user resolved maxFileSizeBytes — for part-level DoS guard
+  chunkSizeBytes: number;       // per-user resolved chunkSizeBytes — enforced per-part after multer
 }
 const uploadSessions = new Map<string, UploadSession>();
 
@@ -463,10 +464,13 @@ router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): 
     receivedBytes: 0,
     createdAt: Date.now(),
     userMaxFileSizeBytes: userLimits.maxFileSizeBytes,
+    chunkSizeBytes: userLimits.chunkSizeBytes,
   });
 
-  req.log.info({ uploadId, name, size }, "Upload session initialised");
-  res.status(201).json({ uploadId, partSize: UPLOAD_PART_SIZE });
+  req.log.info({ uploadId, name, size, chunkSizeBytes: userLimits.chunkSizeBytes }, "Upload session initialised");
+  // partSize is the authoritative chunk size the client must use for this session.
+  // It comes from the user's per-user resolved limits (Firebase → server default fallback).
+  res.status(201).json({ uploadId, partSize: userLimits.chunkSizeBytes });
 });
 
 const partUpload = multer({
@@ -496,7 +500,11 @@ const partUpload = multer({
       cb(null, `part_${idx}`);
     },
   }),
-  limits: { fileSize: UPLOAD_PART_SIZE + 1024 },
+  // Hard cap: 100 MB + framing overhead per part.
+  // This is the absolute server-side ceiling regardless of per-user chunkSizeBytes.
+  // Per-user enforcement (tighter cap) is applied in the route handler after multer,
+  // so that the error message can include the user's actual limit.
+  limits: { fileSize: 100 * 1024 * 1024 + 1024 },
 });
 
 router.post(
@@ -526,6 +534,18 @@ router.post(
       res.status(403).json({ error: "Bu yükleme oturumu bulunamadı veya süresi doldu" });
       return;
     }
+    // SEC: per-part size guard — rejects any single part that exceeds the user's
+    // chunkSizeBytes limit. Multer already blocked parts > 100 MB (server hard cap);
+    // this enforces the tighter per-user cap with a precise error message.
+    // A 1 KB framing allowance covers multipart/form-data boundary overhead.
+    if (req.file.size > rec.chunkSizeBytes + 1024) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      res.status(413).json({
+        error: `Part boyutu limitinizi aşıyor (maks ${(rec.chunkSizeBytes / 1024 / 1024).toFixed(1)} MB / parça)`,
+      });
+      return;
+    }
+
     rec.receivedBytes += req.file.size;
     const ceiling = Math.min(rec.maxBytes * 1.01 + 1024, rec.userMaxFileSizeBytes);
     if (rec.receivedBytes > ceiling) {

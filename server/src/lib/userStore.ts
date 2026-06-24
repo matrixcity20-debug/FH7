@@ -102,11 +102,18 @@ function createUserLocal(username: string, passwordHash: string): User {
   if (users.some((u) => u.username.toLowerCase() === username.toLowerCase())) {
     throw new Error("USERNAME_TAKEN");
   }
+  // Kayıt anında ENV'den gelen sunucu varsayılanlarını kalıcı olarak sakla.
+  // Böylece her kullanıcının limitleri yerel depoda da her zaman açık olur.
   const user: User = {
     id: uuidv4(),
     username,
     passwordHash,
     createdAt: new Date().toISOString(),
+    limits: {
+      storageQuotaBytes: MAX_USER_STORAGE_BYTES,
+      maxFileSizeBytes:  MAX_FILE_SIZE,
+      chunkSizeBytes:    CHUNK_SIZE,
+    },
   };
   users.push(user);
   saveLocalUsers(users);
@@ -154,11 +161,20 @@ async function createUserFirebase(username: string, passwordHash: string): Promi
     throw new Error("USERNAME_TAKEN");
   }
 
+  // Kayıt anında ENV'den gelen sunucu varsayılanlarını Firebase'e yaz.
+  // Böylece her kullanıcının limitleri ilk andan itibaren Firebase'de
+  // açık olarak saklanır; admin sonradan değiştirdiğinde sadece bu alanı
+  // günceller (kullanıcı/şifre alanlarına dokunmaz).
   const user: User = {
     id,
     username,
     passwordHash,
     createdAt: new Date().toISOString(),
+    limits: {
+      storageQuotaBytes: MAX_USER_STORAGE_BYTES,
+      maxFileSizeBytes:  MAX_FILE_SIZE,
+      chunkSizeBytes:    CHUNK_SIZE,
+    },
   };
 
   try {
@@ -248,8 +264,21 @@ export async function migrateUserToFirebase(user: User): Promise<MigrationResult
     return existingOwnerId === user.id ? "already-migrated" : "conflict";
   }
 
+  // Migrasyon sırasında limitler yoksa sunucu varsayılanlarını ekle.
+  // Bu, eski yerel kullanıcıların Firebase'e geçişinde de tam veri tutarlılığını sağlar.
+  const userToWrite: User = user.limits
+    ? user
+    : {
+        ...user,
+        limits: {
+          storageQuotaBytes: MAX_USER_STORAGE_BYTES,
+          maxFileSizeBytes:  MAX_FILE_SIZE,
+          chunkSizeBytes:    CHUNK_SIZE,
+        },
+      };
+
   try {
-    await db.ref(`users/${user.id}`).set(user);
+    await db.ref(`users/${user.id}`).set(userToWrite);
   } catch (err) {
     await indexRef.remove().catch(() => {});
     throw err;
