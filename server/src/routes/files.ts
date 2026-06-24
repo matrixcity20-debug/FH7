@@ -39,6 +39,15 @@ import {
   type FolderMeta,
 } from "../lib/fileStore.js";
 import { getUserLimits } from "../lib/userStore.js";
+import {
+  getSession,
+  setSession,
+  deleteSession,
+  countUserSessions,
+  purgeStaleUploadSessions,
+  MAX_SESSIONS_PER_USER,
+  type UploadSession,
+} from "../lib/uploadSessionStore.js";
 
 const router: IRouter = Router();
 
@@ -88,43 +97,36 @@ function sanitizeMimeType(raw: string): string {
   return BLOCKED_MIME_TYPES.has(lower) ? "application/octet-stream" : (lower || "application/octet-stream").slice(0, 128);
 }
 
-// ── SEC: per-upload session ownership & byte tracking ────────────────────────
-// Tracks in-progress chunked uploads: session ownership (IDOR prevention),
-// declared max size (disk-exhaustion DoS guard), and creation time (TTL-based
-// cleanup of abandoned uploads that never reached finalize).
-interface UploadSession {
-  sessionId: string;            // req.sessionID that called upload-init
-  maxBytes: number;             // client-declared file size — upper bound for received bytes
-  receivedBytes: number;        // running total of bytes written to disk across all parts
-  createdAt: number;            // Date.now() at upload-init time — for TTL cleanup
-  userMaxFileSizeBytes: number;  // per-user resolved maxFileSizeBytes — for part-level DoS guard
-  chunkSizeBytes: number;       // per-user resolved chunkSizeBytes — enforced per-part after multer
-}
-const uploadSessions = new Map<string, UploadSession>();
-
-// Purge upload sessions (and their temp dirs) abandoned for more than 24 hours.
-const UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-
-function purgeStaleUploadSessions(): void {
-  const cutoff = Date.now() - UPLOAD_SESSION_TTL_MS;
-  for (const [uploadId, rec] of uploadSessions) {
-    if (rec.createdAt < cutoff) {
-      uploadSessions.delete(uploadId);
-      cleanupUpload(uploadId);
-    }
-  }
-}
+// Upload session management is handled by uploadSessionStore.ts.
+// Types and Map are imported from there so index.ts can also reach the
+// purge function for the scheduled maintenance sweep.
 
 // Maximum number of file IDs kept in a session's unlockedFiles list
 const MAX_UNLOCKED_FILES = 200;
 
 // BUL-08: per-user upload rate limit (50 uploads/hour)
+// uploadLimiter: guards upload-init and upload-finalize — low ceiling is fine
+// because these are called once per file, not once per chunk.
 const uploadLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  max: 50,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Çok fazla yükleme denemesi. Lütfen bir saat bekleyin." },
+  keyGenerator: (req: Request) => (req.session as Record<string, unknown>)?.["userId"] as string ?? req.ip ?? "unknown",
+});
+
+// partLimiter: guards upload-part exclusively. Must be much more permissive because
+// a single large file generates hundreds of part requests.
+// Ceiling formula: max file size (100 GB) / min chunk size (512 KB) = ~200 000 parts.
+// A practical daily ceiling of 6 000 parts/hour supports a ~30 GB file with 5 MB chunks
+// without false-positive 429s, while still blocking runaway upload abuse.
+const partLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 6000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Çok fazla part isteği. Lütfen bekleyin." },
   keyGenerator: (req: Request) => (req.session as Record<string, unknown>)?.["userId"] as string ?? req.ip ?? "unknown",
 });
 
@@ -451,18 +453,35 @@ router.post("/files/upload-init", requireAuth, uploadLimiter, async (req, res): 
     return;
   }
 
+  // SEC-DoS: cap concurrent in-progress uploads per user.
+  // Without this, a single user can call upload-init thousands of times to
+  // pin arbitrarily many large-file slots in RAM and on disk.
+  const activeSessions = countUserSessions(req.session.userId as string);
+  if (activeSessions >= MAX_SESSIONS_PER_USER) {
+    res.status(429).json({
+      error: `Aynı anda en fazla ${MAX_SESSIONS_PER_USER} yükleme başlatabilirsiniz. Lütfen bekleyip tekrar deneyin.`,
+    });
+    return;
+  }
+
   const uploadId = uuidv4();
   ensureUploadsDir();
   fs.mkdirSync(getUploadTempDir(uploadId), { recursive: true });
-  // SEC-IDOR: bind uploadId → session; includes maxBytes for disk-exhaustion guard
-  // and createdAt for TTL-based cleanup of abandoned uploads.
-  // Purge stale sessions first so the Map does not grow without bound.
+
+  // Purge stale sessions eagerly on every init so the Map cannot grow
+  // without bound between scheduler ticks.
   purgeStaleUploadSessions();
-  uploadSessions.set(uploadId, {
+
+  const now = Date.now();
+  // SEC-IDOR: bind uploadId → session. Includes maxBytes (disk-exhaustion guard),
+  // userId (per-user cap), and dual-axis TTL fields (createdAt + lastActivityAt).
+  setSession(uploadId, {
     sessionId: req.sessionID,
+    userId: req.session.userId as string,
     maxBytes: size,
     receivedBytes: 0,
-    createdAt: Date.now(),
+    createdAt: now,
+    lastActivityAt: now,
     userMaxFileSizeBytes: userLimits.maxFileSizeBytes,
     chunkSizeBytes: userLimits.chunkSizeBytes,
   });
@@ -482,7 +501,7 @@ const partUpload = multer({
       if (!fs.existsSync(dir)) { cb(new Error("Bilinmeyen uploadId"), ""); return; }
       // SEC-IDOR: enforce session ownership *before* writing bytes to disk so an
       // attacker who guesses a UUID cannot inject parts into someone else's upload.
-      const rec = uploadSessions.get(uploadId);
+      const rec = getSession(uploadId);
       if (!rec || rec.sessionId !== req.sessionID) {
         cb(new Error("Bu yükleme oturumu size ait değil"), "");
         return;
@@ -510,7 +529,7 @@ const partUpload = multer({
 router.post(
   "/files/upload-part",
   requireAuth,
-  uploadLimiter,
+  partLimiter,   // separate, higher ceiling — see partLimiter definition above
   partUpload.single("part"),
   async (req, res): Promise<void> => {
     const { uploadId } = req.body as { uploadId: string };
@@ -528,7 +547,7 @@ router.post(
     // exceeds the client-declared size (+ 1 % framing overhead, capped at
     // MAX_FILE_SIZE). This prevents disk exhaustion via 10 k × 5 MB parts
     // that would only be caught by the quota check at finalize time.
-    const rec = uploadSessions.get(uploadId);
+    const rec = getSession(uploadId);
     if (!rec) {
       try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       res.status(403).json({ error: "Bu yükleme oturumu bulunamadı veya süresi doldu" });
@@ -550,11 +569,14 @@ router.post(
     const ceiling = Math.min(rec.maxBytes * 1.01 + 1024, rec.userMaxFileSizeBytes);
     if (rec.receivedBytes > ceiling) {
       try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
-      uploadSessions.delete(uploadId);
+      deleteSession(uploadId);
       cleanupUpload(uploadId);
       res.status(413).json({ error: "Toplam yükleme boyutu bildirilen boyutu aşıyor" });
       return;
     }
+
+    // Advance the inactivity timer so a genuinely slow upload isn't evicted.
+    rec.lastActivityAt = Date.now();
 
     req.log.info({ uploadId, partIndex, bytes: req.file.size }, "Part received");
     res.json({ ok: true, partIndex });
@@ -584,7 +606,7 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     return;
   }
   // SEC-IDOR: verify this request comes from the same session that called upload-init
-  if (uploadSessions.get(uploadId)?.sessionId !== req.sessionID) {
+  if (getSession(uploadId)?.sessionId !== req.sessionID) {
     res.status(403).json({ error: "Bu yükleme oturumu size ait değil" });
     return;
   }
@@ -684,11 +706,11 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
 
     saveMeta(meta);
     // SEC-IDOR: release the uploadId → sessionID binding now that finalize is done
-    uploadSessions.delete(uploadId);
+    deleteSession(uploadId);
     req.log.info({ fileId, name, chunkCount }, "Chunked upload finalised");
     res.status(201).json(meta);
   } catch (err) {
-    uploadSessions.delete(uploadId);
+    deleteSession(uploadId);
     cleanupUpload(uploadId);
     try { deleteFile(fileId); } catch { /* ignore */ }
     req.log.error({ err }, "Finalise failed");

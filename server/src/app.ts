@@ -26,7 +26,10 @@ app.use(
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'"],  // BUL-06: unsafe-inline removed — Vite prod build uses module scripts only
-        styleSrc: ["'self'", "'unsafe-inline'"],
+        // Google Fonts CSS (googleapis.com) and actual font files (gstatic.com) must be
+        // explicitly allowed; Helmet's default blocks all external style/font sources.
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
         imgSrc: ["'self'", "data:", "blob:"],
         mediaSrc: ["'self'", "blob:"],
         connectSrc: ["'self'", "wss:", "ws:", "https:"],
