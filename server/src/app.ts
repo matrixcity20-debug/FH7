@@ -25,16 +25,19 @@ app.use(
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],  // BUL-06: unsafe-inline removed — Vite prod build uses module scripts only
+        // Turnstile widget JS Cloudflare CDN'den yüklenir
+        scriptSrc: ["'self'", "https://challenges.cloudflare.com"],
         // Google Fonts CSS (googleapis.com) and actual font files (gstatic.com) must be
         // explicitly allowed; Helmet's default blocks all external style/font sources.
         styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
         fontSrc: ["'self'", "https://fonts.gstatic.com"],
-        imgSrc: ["'self'", "data:", "blob:"],
+        imgSrc: ["'self'", "data:", "blob:", "https://challenges.cloudflare.com"],
         mediaSrc: ["'self'", "blob:"],
         connectSrc: ["'self'", "wss:", "ws:", "https:"],
         objectSrc: ["'none'"],
         frameAncestors: ["'self'"],
+        // Turnstile widget bir iframe içinde render edilir
+        frameSrc: ["https://challenges.cloudflare.com"],
       },
     },
     crossOriginEmbedderPolicy: false,

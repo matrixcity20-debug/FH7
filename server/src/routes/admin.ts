@@ -21,6 +21,8 @@ import {
   uploadsDir,
 } from "../lib/fileStore.js";
 import { getFirebaseDb } from "../lib/firebase.js";
+import { isR2Configured, listConfiguredBuckets } from "../lib/r2Storage.js";
+import { type FileRecord } from "../lib/fileRegistry.js";
 
 const router: IRouter = Router();
 
@@ -364,6 +366,120 @@ router.delete("/admin/reports/:reportId/file", requireAdmin, adminLimiter, async
 
   req.log.info({ adminId: req.session.userId, reportId, fileId }, "Admin closed report + deleted file");
   res.json({ ok: true, fileDeleted: !!meta });
+});
+
+// ── GET /api/admin/r2/stats ───────────────────────────────────────────────
+// R2 depolama istatistikleri: bucket başına dosya/boyut dağılımı, şifreleme
+// durumu, yapılandırma kontrolü. Firebase kayıtlarından okur; R2'ye ayrıca
+// istek göndermez (hızlı ve ücretsiz).
+//
+// Güvenlik: şifreleme anahtarları (encryptionKeyHex) asla döndürülmez.
+// Yalnızca "şifreli mi?" (boolean) bilgisi verilir.
+router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  const r2Configured = isR2Configured();
+  const configuredBuckets = listConfiguredBuckets();
+  const db = getFirebaseDb();
+
+  if (!db) {
+    res.json({
+      r2Configured,
+      firebaseConnected: false,
+      configuredBuckets,
+      totals: { fileCount: 0, totalBytes: 0, encryptedCount: 0, unencryptedCount: 0 },
+      bucketBreakdown: {},
+      files: [],
+    });
+    return;
+  }
+
+  try {
+    const snap = await db.ref("filesplit_files").once("value");
+    const records = snap.val() as Record<string, FileRecord> | null;
+
+    if (!records) {
+      res.json({
+        r2Configured,
+        firebaseConnected: true,
+        configuredBuckets,
+        totals: { fileCount: 0, totalBytes: 0, encryptedCount: 0, unencryptedCount: 0 },
+        bucketBreakdown: {},
+        files: [],
+      });
+      return;
+    }
+
+    const bucketBreakdown: Record<string, { fileCount: number; totalBytes: number }> = {};
+    const files: Array<{
+      fileId: string;
+      name: string;
+      size: number;
+      mimeType: string;
+      userId: string | undefined;
+      chunkCount: number;
+      bucket: string;
+      encrypted: boolean;
+      uploadedAt: string;
+      r2UploadedAt: string | undefined;
+      expiresAt: string | null;
+    }> = [];
+    let totalBytes = 0;
+    let encryptedCount = 0;
+
+    for (const [fileId, record] of Object.entries(records)) {
+      if (!record?.meta?.id) continue;
+
+      const bucket = record.r2?.bucket ?? "unknown";
+      const size = record.meta.size ?? 0;
+      // SEC: encryptionKeyHex asla dışarı verilmez — yalnızca boolean flag
+      const encrypted = !!(record.r2?.encryptionKeyHex);
+
+      if (!bucketBreakdown[bucket]) {
+        bucketBreakdown[bucket] = { fileCount: 0, totalBytes: 0 };
+      }
+      bucketBreakdown[bucket].fileCount++;
+      bucketBreakdown[bucket].totalBytes += size;
+      totalBytes += size;
+      if (encrypted) encryptedCount++;
+
+      files.push({
+        fileId,
+        name: record.meta.name,
+        size,
+        mimeType: record.meta.mimeType,
+        userId: record.meta.userId,
+        chunkCount: record.meta.chunkCount,
+        bucket,
+        encrypted,
+        uploadedAt: record.meta.uploadedAt,
+        r2UploadedAt: record.r2?.uploadedAt,
+        expiresAt: record.meta.expiresAt ?? null,
+      });
+    }
+
+    const fileCount = files.length;
+
+    req.log.info({ adminId: req.session.userId, fileCount }, "Admin viewed R2 stats");
+
+    res.json({
+      r2Configured,
+      firebaseConnected: true,
+      configuredBuckets,
+      totals: {
+        fileCount,
+        totalBytes,
+        encryptedCount,
+        unencryptedCount: fileCount - encryptedCount,
+      },
+      bucketBreakdown,
+      // En yeni yükleme en üstte
+      files: files.sort(
+        (a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime(),
+      ),
+    });
+  } catch (err) {
+    req.log.error({ err }, "Admin r2Stats error");
+    res.status(500).json({ error: "R2 istatistikleri alınamadı" });
+  }
 });
 
 export default router;

@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useEffect, type ReactNode } from "react";
+import { AuthError, parseRateLimitHeaders } from "@/lib/auth-error";
 
 interface User {
   id: string;
@@ -9,8 +10,8 @@ interface User {
 interface AuthContextValue {
   user: User | null;
   loading: boolean;
-  login: (username: string, password: string) => Promise<void>;
-  register: (username: string, password: string) => Promise<void>;
+  login: (username: string, password: string, turnstileToken: string) => Promise<void>;
+  register: (username: string, password: string, turnstileToken: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -28,32 +29,46 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const login = async (username: string, password: string) => {
+  const login = async (username: string, password: string, turnstileToken: string) => {
     const res = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, turnstileToken }),
     });
+
     if (!res.ok) {
+      const { remaining, resetAt, isRateLimited } = parseRateLimitHeaders(res);
       const data = await res.json() as { error?: string };
-      throw new Error(data.error ?? "Giriş başarısız");
+      throw new AuthError(data.error ?? "Giriş başarısız", {
+        remaining,
+        resetAt,
+        isRateLimited,
+      });
     }
+
     const data = await res.json() as User;
     setUser(data);
   };
 
-  const register = async (username: string, password: string) => {
+  const register = async (username: string, password: string, turnstileToken: string) => {
     const res = await fetch("/api/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, turnstileToken }),
     });
+
     if (!res.ok) {
+      const { remaining, resetAt, isRateLimited } = parseRateLimitHeaders(res);
       const data = await res.json() as { error?: string };
-      throw new Error(data.error ?? "Kayıt başarısız");
+      throw new AuthError(data.error ?? "Kayıt başarısız", {
+        remaining,
+        resetAt,
+        isRateLimited,
+      });
     }
+
     const data = await res.json() as User;
     setUser(data);
   };

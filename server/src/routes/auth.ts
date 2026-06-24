@@ -2,6 +2,7 @@ import { Router, type IRouter } from "express";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import { findUserByUsername, createUser, usernameExists, findUserById, updateLastLogin } from "../lib/userStore.js";
+import { verifyTurnstile } from "../lib/turnstile.js";
 
 declare module "express-session" {
   interface SessionData {
@@ -20,8 +21,38 @@ const authLimiter = rateLimit({
   skipSuccessfulRequests: true,
 });
 
+/** Cloudflare Turnstile token'ını doğrular; başarısız olursa 400 döner ve true döndürür (guard). */
+async function rejectIfCaptchaFailed(
+  req: import("express").Request,
+  res: import("express").Response,
+  token: unknown,
+): Promise<boolean> {
+  const result = await verifyTurnstile(
+    typeof token === "string" ? token : undefined,
+    req.ip,
+  );
+
+  if (!result.success) {
+    req.log.warn(
+      { errorCodes: result.errorCodes, ip: req.ip, path: req.path },
+      "Turnstile verification failed",
+    );
+    res.status(400).json({ error: "Captcha doğrulaması başarısız. Lütfen sayfayı yenileyip tekrar deneyin." });
+    return true;
+  }
+
+  return false;
+}
+
 router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
-  const { username, password } = req.body as { username?: string; password?: string };
+  const { username, password, turnstileToken } = req.body as {
+    username?: string;
+    password?: string;
+    turnstileToken?: string;
+  };
+
+  // Captcha doğrulaması — diğer kontrollere geçmeden önce yapılır
+  if (await rejectIfCaptchaFailed(req, res, turnstileToken)) return;
 
   if (!username || typeof username !== "string" || username.trim().length < 3) {
     res.status(400).json({ error: "Kullanıcı adı en az 3 karakter olmalıdır" });
@@ -44,7 +75,6 @@ router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
 
   if (await usernameExists(trimmedUsername)) {
     // SEC-enum: equalize timing with the real registration path (bcrypt ~100ms)
-    // so an attacker cannot distinguish "taken" from "registered" by response time.
     await bcrypt.hash(password, 12);
     res.status(201).json({ message: "Kayıt tamamlandı. Giriş yapmayı deneyin." });
     return;
@@ -74,7 +104,14 @@ router.post("/auth/register", authLimiter, async (req, res): Promise<void> => {
 });
 
 router.post("/auth/login", authLimiter, async (req, res): Promise<void> => {
-  const { username, password } = req.body as { username?: string; password?: string };
+  const { username, password, turnstileToken } = req.body as {
+    username?: string;
+    password?: string;
+    turnstileToken?: string;
+  };
+
+  // Captcha doğrulaması — kimlik bilgilerini kontrol etmeden önce yapılır
+  if (await rejectIfCaptchaFailed(req, res, turnstileToken)) return;
 
   if (!username || !password) {
     res.status(400).json({ error: "Kullanıcı adı ve şifre gereklidir" });

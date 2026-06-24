@@ -49,6 +49,20 @@ import {
   MAX_SESSIONS_PER_USER,
   type UploadSession,
 } from "../lib/uploadSessionStore.js";
+import {
+  isR2Configured,
+  generateEncryptionKey,
+  uploadChunkToR2,
+  downloadChunkFromR2,
+  deleteFileChunksFromR2,
+  pickUploadBucket,
+} from "../lib/r2Storage.js";
+import {
+  saveFileRecord,
+  getFileRecord,
+  deleteFileRecord,
+  type R2FileInfo,
+} from "../lib/fileRegistry.js";
 
 const router: IRouter = Router();
 
@@ -151,8 +165,6 @@ const unlockLimiter = rateLimit({
     `${req.ip ?? "unknown"}:${req.params["fileId"] ?? ""}`,
 });
 
-type FileMeta = import("../lib/fileStore.js").FileMeta;
-
 function canAccess(
   meta: FileMeta,
   req: Request,
@@ -246,6 +258,138 @@ async function checkUserQuota(
     ok: false,
     message: `Depolama kotanız doldu (${usedMb} MB / ${limitMb} MB kullanılıyor). Devam etmek için bazı dosyaları silin.`,
   };
+}
+
+// ── R2 Yardımcı Fonksiyonları ────────────────────────────────────────────────
+
+/**
+ * Yerel chunk'ları R2'ye şifreleyerek yükler ve kaydı Firebase'e yazar.
+ * Background olarak çalışır — yanıt zaten gönderilmiştir.
+ * Hata yerel dosyalara dokunmaz; R2 yedek katman olarak işlev görür.
+ */
+async function uploadFileChunksToR2(
+  meta: FileMeta,
+  log: Request["log"],
+): Promise<void> {
+  if (!isR2Configured()) return;
+
+  const encryptionKey = generateEncryptionKey();
+  // Round-robin bucket seçimi — her dosya hangi bucket'a gittiğini Firebase'de taşır
+  const bucket = pickUploadBucket();
+
+  // Chunk'ları paralel yükle (en fazla 6 eşzamanlı — ağı sarmamak için)
+  const CONCURRENCY = 6;
+  for (let start = 0; start < meta.chunkCount; start += CONCURRENCY) {
+    const batch = Array.from(
+      { length: Math.min(CONCURRENCY, meta.chunkCount - start) },
+      (_, j) => {
+        const i = start + j;
+        const chunkPath = getChunkPath(meta.id, i);
+        const data = fs.readFileSync(chunkPath);
+        return uploadChunkToR2(meta.id, i, data, encryptionKey, bucket).catch((err: unknown) => {
+          log.error({ err, fileId: meta.id, chunkIndex: i, bucket }, "R2 chunk upload failed");
+          throw err;
+        });
+      },
+    );
+    await Promise.all(batch);
+  }
+
+  const r2Info: R2FileInfo = {
+    bucket,
+    encryptionKeyHex: encryptionKey.toString("hex"),
+    chunkCount: meta.chunkCount,
+    uploadedAt: new Date().toISOString(),
+  };
+
+  await saveFileRecord(meta, r2Info);
+  log.info({ fileId: meta.id, chunkCount: meta.chunkCount }, "File chunks uploaded to R2");
+}
+
+/**
+ * Eksik bir chunk'ı R2'den on-demand olarak geri yükler.
+ * Başarılıysa chunk yerel diske yazılır ve `true` döner.
+ * R2 yapılandırılmamışsa veya kayıt bulunamazsa `false` döner.
+ */
+async function tryRestoreChunkFromR2(
+  fileId: string,
+  chunkIndex: number,
+  log: Request["log"],
+): Promise<boolean> {
+  if (!isR2Configured()) return false;
+
+  try {
+    const record = await getFileRecord(fileId);
+    if (!record?.r2?.encryptionKeyHex) return false;
+
+    const encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
+    if (encryptionKey.length !== 32) {
+      log.warn({ fileId, chunkIndex }, "Invalid encryption key length in Firebase record");
+      return false;
+    }
+
+    const bucket = record.r2.bucket;
+    log.info({ fileId, chunkIndex, bucket }, "Restoring chunk from R2");
+    const plaintext = await downloadChunkFromR2(fileId, chunkIndex, encryptionKey, bucket);
+
+    const chunkPath = getChunkPath(fileId, chunkIndex);
+    const dir = path.dirname(chunkPath);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(chunkPath, plaintext);
+
+    log.info({ fileId, chunkIndex, bytes: plaintext.length }, "Chunk restored from R2");
+    return true;
+  } catch (err) {
+    log.error({ err, fileId, chunkIndex }, "Failed to restore chunk from R2");
+    return false;
+  }
+}
+
+/**
+ * Bir dosyanın tüm eksik chunk'larını R2'den toplu olarak geri yükler.
+ * Firebase kaydı TEK SEFERLE okunur (N chunk için N istek yerine 1 istek).
+ * Download endpoint için kullanılır.
+ * @returns Tüm chunk'lar sağlanabiliyorsa true
+ */
+async function ensureAllChunksLocal(
+  meta: FileMeta,
+  log: Request["log"],
+): Promise<boolean> {
+  // Hızlı yol: tüm chunk'lar mevcutsa Firebase'e hiç dokunma
+  const missingIndices: number[] = [];
+  for (let i = 0; i < meta.chunkCount; i++) {
+    if (!fs.existsSync(getChunkPath(meta.id, i))) missingIndices.push(i);
+  }
+  if (missingIndices.length === 0) return true;
+
+  if (!isR2Configured()) return false;
+
+  // Firebase kaydını bir kere çek — bucket + anahtar
+  const record = await getFileRecord(meta.id);
+  if (!record?.r2?.encryptionKeyHex || !record.r2.bucket) return false;
+
+  const encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
+  if (encryptionKey.length !== 32) {
+    log.warn({ fileId: meta.id }, "Invalid encryption key length in Firebase record");
+    return false;
+  }
+
+  const bucket = record.r2.bucket;
+
+  for (const i of missingIndices) {
+    try {
+      log.info({ fileId: meta.id, chunkIndex: i, bucket }, "Restoring chunk from R2 (batch)");
+      const plaintext = await downloadChunkFromR2(meta.id, i, encryptionKey, bucket);
+      const chunkPath = getChunkPath(meta.id, i);
+      fs.mkdirSync(path.dirname(chunkPath), { recursive: true });
+      fs.writeFileSync(chunkPath, plaintext);
+      log.info({ fileId: meta.id, chunkIndex: i, bytes: plaintext.length }, "Chunk restored");
+    } catch (err) {
+      log.error({ err, fileId: meta.id, chunkIndex: i }, "Failed to restore chunk from R2");
+      return false;
+    }
+  }
+  return true;
 }
 
 // ── Storage stats — authenticated, returns per-user resolved limits + usage ──
@@ -423,6 +567,10 @@ router.post(
       };
 
       saveMeta(meta);
+      // ── R2: chunk'ları arka planda yükle (yanıt gecikmesin)
+      void uploadFileChunksToR2(meta, req.log).catch((err: unknown) => {
+        req.log.error({ err, fileId }, "R2 background upload failed (simple)");
+      });
       req.log.info({ fileId, name: meta.name, chunkCount }, "File uploaded");
       res.status(201).json(meta);
     } catch (err) {
@@ -719,6 +867,10 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     };
 
     saveMeta(meta);
+    // ── R2: chunk'ları arka planda yükle (yanıt gecikmesin)
+    void uploadFileChunksToR2(meta, req.log).catch((err: unknown) => {
+      req.log.error({ err, fileId: meta.id }, "R2 background upload failed (finalize)");
+    });
     // SEC-IDOR: release the uploadId → sessionID binding now that finalize is done
     deleteSession(uploadId);
     req.log.info({ fileId, name, chunkCount }, "Chunked upload finalised");
@@ -896,6 +1048,23 @@ router.delete("/files/:fileId", requireAuth, async (req, res): Promise<void> => 
   }
 
   deleteFile(fileId);
+  // R2 + Firebase temizliği (best-effort, arka planda)
+  // Önce Firebase kaydından doğru bucket adını al, sonra sil
+  void (async () => {
+    try {
+      const record = await getFileRecord(fileId);
+      if (record?.r2?.bucket) {
+        await deleteFileChunksFromR2(meta.id, meta.chunkCount, record.r2.bucket).catch(
+          (err: unknown) => req.log.warn({ err, fileId }, "R2 chunk deletion failed (non-fatal)"),
+        );
+      }
+      await deleteFileRecord(fileId).catch((err: unknown) =>
+        req.log.warn({ err, fileId }, "Firebase record deletion failed (non-fatal)"),
+      );
+    } catch (err) {
+      req.log.warn({ err, fileId }, "R2/Firebase cleanup error (non-fatal)");
+    }
+  })();
   req.log.info({ fileId }, "File deleted");
   res.sendStatus(204);
 });
@@ -952,11 +1121,11 @@ router.get("/files/:fileId/download", downloadLimiter, async (req, res): Promise
     return;
   }
 
-  for (let i = 0; i < meta.chunkCount; i++) {
-    if (!fs.existsSync(getChunkPath(fileId, i))) {
-      res.status(500).json({ error: `Chunk ${i} eksik` });
-      return;
-    }
+  // R2 restore: eksik chunk'ları R2'den getir
+  const allAvailable = await ensureAllChunksLocal(meta, req.log);
+  if (!allAvailable) {
+    res.status(500).json({ error: "Dosya chunk'ları tamamlanamadı. Lütfen tekrar deneyin." });
+    return;
   }
 
   const safeName = encodeURIComponent(meta.name).replace(/'/g, "%27");
@@ -1020,8 +1189,12 @@ router.get(
 
     const chunkPath = getChunkPath(fileId, chunkIndex);
     if (!fs.existsSync(chunkPath)) {
-      res.status(404).json({ error: "Chunk dosyası eksik" });
-      return;
+      // R2'den on-demand geri yükleme dene
+      const restored = await tryRestoreChunkFromR2(fileId, chunkIndex, req.log);
+      if (!restored) {
+        res.status(404).json({ error: "Chunk dosyası eksik ve R2'den geri yüklenemedi" });
+        return;
+      }
     }
 
     res.setHeader("Content-Type", "application/octet-stream");

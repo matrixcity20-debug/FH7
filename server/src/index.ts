@@ -5,6 +5,7 @@ import { logger } from "./lib/logger.js";
 import { purgeExpiredFiles, purgeStaleUploadDirs } from "./lib/fileStore.js";
 import { purgeStaleUploadSessions } from "./lib/uploadSessionStore.js";
 import { attachSignalingServer } from "./lib/signaling.js";
+import { restoreMetaFilesFromFirebase } from "./lib/fileRegistry.js";
 
 const rawPort = process.env["PORT"];
 
@@ -35,6 +36,17 @@ httpServer.listen(port, (err?: Error) => {
 // Run once on boot so stale state from a previous process doesn't linger.
 const purged = purgeExpiredFiles();
 if (purged > 0) logger.info({ purged }, "Purged expired files on startup");
+
+// ── R2/Firebase: Deploy sonrası meta.json dosyalarını geri yükle ───────────
+// uploads/ klasörü deploy'da silinmiş olabilir; Firebase'deki kayıtlardan
+// eksik meta.json'ları yeniden oluşturuyoruz. Chunk'lar on-demand R2'den gelir.
+restoreMetaFilesFromFirebase()
+  .then((count) => {
+    if (count > 0) logger.info({ count }, "Restored meta files from Firebase on startup");
+  })
+  .catch((err) => {
+    logger.error({ err }, "Failed to restore meta files from Firebase on startup");
+  });
 
 // purgeStaleUploadSessions cleans the in-memory Map; purgeStaleUploadDirs
 // cleans any orphan upload_ directories left on disk from a previous server
