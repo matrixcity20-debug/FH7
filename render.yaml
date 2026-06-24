@@ -23,6 +23,15 @@ services:
         sync: false
       - key: FIREBASE_DATABASE_URL
         sync: false
+      # ── Cloudflare R2 Depolama ────────────────────────────────────────────
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAMES
+        sync: false
       # ── Upload limits (optional — defaults shown) ──────────────────────────
       # Non-numeric values silently fall back to the defaults listed below.
       - key: MAX_FILE_SIZE_MB

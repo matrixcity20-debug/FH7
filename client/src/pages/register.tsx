@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import { useLocation } from "wouter";
 import { Layers, UserPlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -6,7 +6,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/hooks/use-auth";
 import { toast } from "@/hooks/use-toast";
-import TurnstileWidget from "@/components/TurnstileWidget";
 import RateLimitWarning from "@/components/RateLimitWarning";
 import { AuthError } from "@/lib/auth-error";
 
@@ -17,37 +16,15 @@ export default function RegisterPage() {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [loading, setLoading] = useState(false);
-  const [turnstileToken, setTurnstileToken] = useState<string>("");
-  const [captchaExpired, setCaptchaExpired] = useState(false);
 
   // Rate limit durumu
   const [remaining, setRemaining] = useState<number | null>(null);
   const [resetAt, setResetAt] = useState<Date | null>(null);
   const [isRateLimited, setIsRateLimited] = useState(false);
 
-  const handleVerify = useCallback((token: string) => {
-    setTurnstileToken(token);
-    setCaptchaExpired(false);
-  }, []);
-
-  const handleExpire = useCallback(() => {
-    setTurnstileToken("");
-    setCaptchaExpired(true);
-  }, []);
-
-  const handleError = useCallback(() => {
-    setTurnstileToken("");
-    toast({
-      variant: "destructive",
-      title: "Captcha yüklenemedi",
-      description: "Lütfen sayfayı yenileyip tekrar deneyin.",
-    });
-  }, []);
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!username || !password) return;
-
     if (isRateLimited) return;
 
     if (password !== confirm) {
@@ -59,31 +36,18 @@ export default function RegisterPage() {
       return;
     }
 
-    if (!turnstileToken) {
-      toast({
-        variant: "destructive",
-        title: "Captcha doğrulaması gerekli",
-        description: captchaExpired
-          ? "Captcha süresi doldu, lütfen tekrar doğrulayın."
-          : "Lütfen captcha doğrulamasını tamamlayın.",
-      });
-      return;
-    }
-
     setLoading(true);
     try {
-      await register(username, password, turnstileToken);
+      await register(username, password);
       toast({ title: "Hesap oluşturuldu!", description: "Hoş geldiniz!" });
       setLocation("/");
     } catch (err) {
-      // Rate limit bilgisini state'e aktar
       if (err instanceof AuthError) {
         if (err.remaining !== null) setRemaining(err.remaining);
         if (err.resetAt !== null) setResetAt(err.resetAt);
         setIsRateLimited(err.isRateLimited);
       }
 
-      // Tam kilit durumunda generic toast yerine banner yeterli
       if (!(err instanceof AuthError && err.isRateLimited)) {
         toast({
           variant: "destructive",
@@ -91,9 +55,6 @@ export default function RegisterPage() {
           description: err instanceof Error ? err.message : "Bir hata oluştu",
         });
       }
-
-      // Token tek kullanımlık — hata sonrası sıfırla
-      setTurnstileToken("");
     } finally {
       setLoading(false);
     }
@@ -159,26 +120,16 @@ export default function RegisterPage() {
             />
           </div>
 
-          {/* Rate limit uyarısı — captcha'nın hemen üstünde */}
           <RateLimitWarning
             remaining={remaining}
             resetAt={resetAt}
             isRateLimited={isRateLimited}
           />
 
-          {!isLocked && (
-            <TurnstileWidget
-              onVerify={handleVerify}
-              onExpire={handleExpire}
-              onError={handleError}
-              theme="auto"
-            />
-          )}
-
           <Button
             type="submit"
             className="w-full gap-2 font-mono"
-            disabled={loading || !turnstileToken || isLocked}
+            disabled={loading || isLocked}
           >
             <UserPlus className="w-4 h-4" />
             {loading ? "Hesap oluşturuluyor..." : "Kayıt Ol"}

@@ -10,8 +10,8 @@ interface User {
 interface AuthContextValue {
   user: User | null;
   loading: boolean;
-  login: (username: string, password: string, turnstileToken: string) => Promise<void>;
-  register: (username: string, password: string, turnstileToken: string) => Promise<void>;
+  login: (username: string, password: string) => Promise<void>;
+  register: (username: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -29,12 +29,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const login = async (username: string, password: string, turnstileToken: string) => {
+  const login = async (username: string, password: string) => {
     const res = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
-      body: JSON.stringify({ username, password, turnstileToken }),
+      body: JSON.stringify({ username, password }),
     });
 
     if (!res.ok) {
@@ -51,12 +51,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(data);
   };
 
-  const register = async (username: string, password: string, turnstileToken: string) => {
+  const register = async (username: string, password: string) => {
     const res = await fetch("/api/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
-      body: JSON.stringify({ username, password, turnstileToken }),
+      body: JSON.stringify({ username, password }),
     });
 
     if (!res.ok) {
