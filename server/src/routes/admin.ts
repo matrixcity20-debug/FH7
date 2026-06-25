@@ -33,6 +33,11 @@ import {
   listConfiguredB2Buckets,
   testB2Connectivity,
 } from "../lib/b2Storage.js";
+import {
+  isE2Configured,
+  listConfiguredE2Buckets,
+  testE2Connectivity,
+} from "../lib/e2Storage.js";
 
 const router: IRouter = Router();
 
@@ -379,21 +384,21 @@ router.delete("/admin/reports/:reportId/file", requireAdmin, adminLimiter, async
 });
 
 // ── POST /api/admin/storage/test ──────────────────────────────────────────
-// R2 ve/veya B2 bucket'larına gerçek bir test dosyası yükler ve siler.
+// R2, B2 ve/veya e2 bucket'larına gerçek bir test dosyası yükler ve siler.
 // Bağlantı, kimlik doğrulaması ve bucket izinlerini doğrular.
-// body: { provider?: "r2" | "b2" | "all" }
+// body: { provider?: "r2" | "b2" | "e2" | "all" }
 // Güvenlik: yalnızca admin erişimi; rate-limit uygulanır.
 router.post("/admin/storage/test", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
   const body = req.body as { provider?: string };
   const targetProvider = (body.provider ?? "all").toLowerCase();
 
-  if (!["r2", "b2", "all"].includes(targetProvider)) {
-    res.status(400).json({ error: "Geçersiz provider değeri (r2, b2 veya all olmalı)" });
+  if (!["r2", "b2", "e2", "all"].includes(targetProvider)) {
+    res.status(400).json({ error: "Geçersiz provider değeri (r2, b2, e2 veya all olmalı)" });
     return;
   }
 
   interface BucketTestResult {
-    provider: "r2" | "b2";
+    provider: "r2" | "b2" | "e2";
     bucket: string;
     success: boolean;
     latencyMs: number;
@@ -420,6 +425,15 @@ router.post("/admin/storage/test", requireAdmin, adminLimiter, async (req, res):
     }
   }
 
+  // e2 testleri
+  if ((targetProvider === "e2" || targetProvider === "all") && isE2Configured()) {
+    for (const bucket of listConfiguredE2Buckets()) {
+      tasks.push(
+        testE2Connectivity(bucket).then((r) => ({ provider: "e2" as const, bucket, ...r })),
+      );
+    }
+  }
+
   if (tasks.length === 0) {
     res.status(400).json({
       error:
@@ -435,7 +449,15 @@ router.post("/admin/storage/test", requireAdmin, adminLimiter, async (req, res):
     const allOk = results.every((r) => r.success);
 
     req.log.info(
-      { adminId: req.session.userId, results: results.map((r) => ({ provider: r.provider, bucket: r.bucket, success: r.success, latencyMs: r.latencyMs })) },
+      {
+        adminId: req.session.userId,
+        results: results.map((r) => ({
+          provider: r.provider,
+          bucket: r.bucket,
+          success: r.success,
+          latencyMs: r.latencyMs,
+        })),
+      },
       "Admin storage connectivity test",
     );
 
@@ -447,9 +469,9 @@ router.post("/admin/storage/test", requireAdmin, adminLimiter, async (req, res):
 });
 
 // ── GET /api/admin/r2/stats ───────────────────────────────────────────────
-// Depolama istatistikleri: R2 + B2 bucket başına dosya/boyut dağılımı,
+// Depolama istatistikleri: R2 + B2 + e2 bucket başına dosya/boyut dağılımı,
 // şifreleme durumu, yapılandırma kontrolü. Firebase kayıtlarından okur;
-// R2/B2'ye ayrıca istek göndermez (hızlı ve ücretsiz).
+// R2/B2/e2'ye ayrıca istek göndermez (hızlı ve ücretsiz).
 //
 // Güvenlik: şifreleme anahtarları (encryptionKeyHex) asla döndürülmez.
 // Yalnızca "şifreli mi?" (boolean) bilgisi verilir.
@@ -461,9 +483,11 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
     res.json({
       r2Configured: storage.r2Configured,
       b2Configured: storage.b2Configured,
+      e2Configured: storage.e2Configured,
       firebaseConnected: false,
       configuredBuckets: storage.r2Buckets,
       b2Buckets: storage.b2Buckets,
+      e2Buckets: storage.e2Buckets,
       totals: { fileCount: 0, totalBytes: 0, encryptedCount: 0, unencryptedCount: 0 },
       bucketBreakdown: {},
       files: [],
@@ -479,9 +503,11 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       res.json({
         r2Configured: storage.r2Configured,
         b2Configured: storage.b2Configured,
+        e2Configured: storage.e2Configured,
         firebaseConnected: true,
         configuredBuckets: storage.r2Buckets,
         b2Buckets: storage.b2Buckets,
+        e2Buckets: storage.e2Buckets,
         totals: { fileCount: 0, totalBytes: 0, encryptedCount: 0, unencryptedCount: 0 },
         bucketBreakdown: {},
         files: [],
@@ -491,7 +517,7 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
 
     const bucketBreakdown: Record<
       string,
-      { fileCount: number; totalBytes: number; provider: "r2" | "b2" | "unknown" }
+      { fileCount: number; totalBytes: number; provider: "r2" | "b2" | "e2" | "unknown" }
     > = {};
     const files: Array<{
       fileId: string;
@@ -500,7 +526,7 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       mimeType: string;
       userId: string | undefined;
       chunkCount: number;
-      provider: "r2" | "b2" | "unknown";
+      provider: "r2" | "b2" | "e2" | "unknown";
       bucket: string;
       encrypted: boolean;
       uploadedAt: string;
@@ -521,7 +547,7 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       const cloudStatus = record.cloudUpload?.status ?? "legacy";
       const isReady = cloudStatus === "ready" || cloudStatus === "legacy";
 
-      const provider: "r2" | "b2" | "unknown" = record.r2?.provider ?? "unknown";
+      const provider: "r2" | "b2" | "e2" | "unknown" = record.r2?.provider ?? "unknown";
       const bucket = record.r2?.bucket ?? "pending";
       const size = record.meta.size ?? 0;
       // SEC: encryptionKeyHex asla dışarı verilmez — yalnızca boolean flag
@@ -570,9 +596,11 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
     res.json({
       r2Configured: storage.r2Configured,
       b2Configured: storage.b2Configured,
+      e2Configured: storage.e2Configured,
       firebaseConnected: true,
       configuredBuckets: storage.r2Buckets,
       b2Buckets: storage.b2Buckets,
+      e2Buckets: storage.e2Buckets,
       totals: {
         fileCount,
         totalBytes,

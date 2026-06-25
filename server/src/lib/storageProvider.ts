@@ -1,10 +1,10 @@
 /**
- * Birleşik Depolama Yönlendiricisi — Cloudflare R2 + Backblaze B2
+ * Birleşik Depolama Yönlendiricisi — Cloudflare R2 + Backblaze B2 + iDrive e2
  *
- * Tüm R2 ve B2 bucket'larını tek bir havuzda toplar.
+ * Tüm R2, B2 ve e2 bucket'larını tek bir havuzda toplar.
  * Round-robin ile yük dağıtımı yapar:
- *   R2 buckets: [r2-a, r2-b]  +  B2 buckets: [b2-a, b2-b]
- *   → Sıra: r2-a → r2-b → b2-a → b2-b → r2-a → ...
+ *   R2 buckets: [r2-a, r2-b]  +  B2 buckets: [b2-a]  +  e2 buckets: [e2-a]
+ *   → Sıra: r2-a → r2-b → b2-a → e2-a → r2-a → ...
  *
  * Her dosya hangi provider + bucket'ta saklandığını Firebase kaydında taşır.
  * İndirme ve silme işlemleri her zaman doğru servise yönlendirilir.
@@ -25,11 +25,18 @@ import {
   downloadChunkFromB2,
   deleteFileChunksFromB2,
 } from "./b2Storage.js";
+import {
+  isE2Configured,
+  listConfiguredE2Buckets,
+  uploadChunkToE2,
+  downloadChunkFromE2,
+  deleteFileChunksFromE2,
+} from "./e2Storage.js";
 
-export type StorageProvider = "r2" | "b2";
+export type StorageProvider = "r2" | "b2" | "e2";
 
 export interface StorageTarget {
-  /** Hangi servis: Cloudflare R2 veya Backblaze B2 */
+  /** Hangi servis: Cloudflare R2, Backblaze B2 veya iDrive e2 */
   provider: StorageProvider;
   /** Hedef bucket adı */
   bucket: string;
@@ -46,8 +53,8 @@ let _rrIndex = 0;
 // ── Provider Yönetimi ─────────────────────────────────────────────────────────
 
 /**
- * Yapılandırılmış tüm depolama hedeflerini döner (R2 + B2 birlikte).
- * R2 bucket'ları önce, B2 bucket'ları sonra listelenir.
+ * Yapılandırılmış tüm depolama hedeflerini döner (R2 + B2 + e2 birlikte).
+ * R2 bucket'ları önce, B2 bucket'ları sonra, e2 bucket'ları en sona listelenir.
  */
 export function listAllTargets(): StorageTarget[] {
   const r2Targets = listR2Buckets().map(
@@ -56,14 +63,17 @@ export function listAllTargets(): StorageTarget[] {
   const b2Targets = listConfiguredB2Buckets().map(
     (bucket): StorageTarget => ({ provider: "b2", bucket }),
   );
-  return [...r2Targets, ...b2Targets];
+  const e2Targets = listConfiguredE2Buckets().map(
+    (bucket): StorageTarget => ({ provider: "e2", bucket }),
+  );
+  return [...r2Targets, ...b2Targets, ...e2Targets];
 }
 
 /**
  * En az bir depolama servisinin yapılandırılmış olup olmadığını kontrol eder.
  */
 export function isAnyStorageConfigured(): boolean {
-  return isR2Configured() || isB2Configured();
+  return isR2Configured() || isB2Configured() || isE2Configured();
 }
 
 /**
@@ -75,7 +85,8 @@ export function pickUploadTarget(): StorageTarget {
   if (targets.length === 0) {
     throw new Error(
       "Hiç depolama servisi yapılandırılmamış " +
-      "(R2_BUCKET_NAMES/R2_BUCKET_NAME veya B2_BUCKET_NAMES/B2_BUCKET_NAME eksik)",
+        "(R2_BUCKET_NAMES/R2_BUCKET_NAME, B2_BUCKET_NAMES/B2_BUCKET_NAME " +
+        "veya E2_BUCKET_NAMES/E2_BUCKET_NAME eksik)",
     );
   }
   const target = targets[_rrIndex % targets.length]!;
@@ -90,15 +101,19 @@ export function pickUploadTarget(): StorageTarget {
 export function getStorageSummary(): {
   r2Configured: boolean;
   b2Configured: boolean;
+  e2Configured: boolean;
   r2Buckets: string[];
   b2Buckets: string[];
+  e2Buckets: string[];
   allTargets: StorageTarget[];
 } {
   return {
     r2Configured: isR2Configured(),
     b2Configured: isB2Configured(),
+    e2Configured: isE2Configured(),
     r2Buckets: listR2Buckets(),
     b2Buckets: listConfiguredB2Buckets(),
+    e2Buckets: listConfiguredE2Buckets(),
     allTargets: listAllTargets(),
   };
 }
@@ -107,7 +122,7 @@ export function getStorageSummary(): {
 
 /**
  * Bir chunk'ı şifreleyerek belirtilen hedefe yükler.
- * Hedef provider'a göre R2 veya B2 istemcisine yönlendirir.
+ * Hedef provider'a göre R2, B2 veya e2 istemcisine yönlendirir.
  */
 export async function uploadChunkToStorage(
   target: StorageTarget,
@@ -119,12 +134,15 @@ export async function uploadChunkToStorage(
   if (target.provider === "b2") {
     return uploadChunkToB2(fileId, chunkIndex, plaintext, encryptionKey, target.bucket);
   }
+  if (target.provider === "e2") {
+    return uploadChunkToE2(fileId, chunkIndex, plaintext, encryptionKey, target.bucket);
+  }
   return uploadChunkToR2(fileId, chunkIndex, plaintext, encryptionKey, target.bucket);
 }
 
 /**
  * Bir chunk'ı belirtilen hedeften indirir ve şifresini çözer.
- * Hedef provider'a göre R2 veya B2 istemcisine yönlendirir.
+ * Hedef provider'a göre R2, B2 veya e2 istemcisine yönlendirir.
  */
 export async function downloadChunkFromStorage(
   target: StorageTarget,
@@ -135,12 +153,15 @@ export async function downloadChunkFromStorage(
   if (target.provider === "b2") {
     return downloadChunkFromB2(fileId, chunkIndex, encryptionKey, target.bucket);
   }
+  if (target.provider === "e2") {
+    return downloadChunkFromE2(fileId, chunkIndex, encryptionKey, target.bucket);
+  }
   return downloadChunkFromR2(fileId, chunkIndex, encryptionKey, target.bucket);
 }
 
 /**
  * Bir dosyanın tüm chunk'larını belirtilen hedeften siler (best-effort).
- * Hedef provider'a göre R2 veya B2 istemcisine yönlendirir.
+ * Hedef provider'a göre R2, B2 veya e2 istemcisine yönlendirir.
  */
 export async function deleteFileChunksFromStorage(
   target: StorageTarget,
@@ -149,6 +170,9 @@ export async function deleteFileChunksFromStorage(
 ): Promise<void> {
   if (target.provider === "b2") {
     return deleteFileChunksFromB2(fileId, chunkCount, target.bucket);
+  }
+  if (target.provider === "e2") {
+    return deleteFileChunksFromE2(fileId, chunkCount, target.bucket);
   }
   return deleteFileChunksFromR2(fileId, chunkCount, target.bucket);
 }

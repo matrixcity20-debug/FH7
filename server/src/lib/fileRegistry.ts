@@ -37,7 +37,7 @@ const FB_ROOT = "filesplit_files";
 // ── Arayüzler ─────────────────────────────────────────────────────────────────
 
 export interface R2FileInfo {
-  provider?: "r2" | "b2";
+  provider?: "r2" | "b2" | "e2";
   bucket: string;
   encryptionKeyHex: string;
   chunkCount: number;
