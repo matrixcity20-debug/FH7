@@ -136,6 +136,11 @@ export function decryptChunk(encrypted: Buffer, key: Buffer): Buffer {
   const authTag = encrypted.subarray(encrypted.length - GCM_TAG_BYTES);
   const ciphertext = encrypted.subarray(GCM_IV_BYTES, encrypted.length - GCM_TAG_BYTES);
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  // SEC: explicitly assert the expected tag length before supplying the tag.
+  // Without this, an attacker could submit a shorter truncated tag and the
+  // Node.js runtime would accept it — weakening authentication guarantees.
+  // setAuthTagLength must be called before setAuthTag.
+  decipher.setAuthTagLength(GCM_TAG_BYTES);
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }

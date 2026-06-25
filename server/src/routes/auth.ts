@@ -110,7 +110,7 @@ router.post("/auth/login", authLimiter, async (req, res): Promise<void> => {
   updateLastLogin(user.id).catch(() => {});
 
   req.log.info({ userId: user.id }, "User logged in");
-  res.json({ id: user.id, username: user.username });
+  res.json({ id: user.id, username: user.username, isAdmin: checkIsAdmin(user.id) });
 });
 
 router.post("/auth/logout", (req, res): void => {

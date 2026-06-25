@@ -86,7 +86,15 @@ const upload = multer({
       cb(null, `tmp_${uuidv4()}`);
     },
   }),
-  limits: { fileSize: MAX_FILE_SIZE },
+  limits: {
+    fileSize: MAX_FILE_SIZE,
+    // SEC: CVE-2025-48997 — multer <2.0.1 allows DoS via empty field names.
+    // Upgrading to >=2.0.1 is the primary fix; these limits are belt-and-
+    // suspenders: reject oversized field names and cap total fields to 1
+    // (this endpoint only accepts a single file field).
+    fieldNameSize: 256,
+    fields: 1,
+  },
 });
 
 const TTL_OPTIONS: Record<string, number> = {

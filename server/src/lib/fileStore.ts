@@ -98,7 +98,12 @@ export function saveFolderMeta(folder: FolderMeta): void {
 
 export function readFolderMeta(folderId: string): FolderMeta | null {
   if (!isValidFolderId(folderId)) return null;
-  const p = getFolderMetaPath(folderId);
+  let p: string;
+  try {
+    p = safeFolderMetaPath(folderId);
+  } catch {
+    return null;
+  }
   if (!fs.existsSync(p)) return null;
   try {
     return JSON.parse(fs.readFileSync(p, "utf-8")) as FolderMeta;
@@ -125,7 +130,12 @@ export function listFolders(userId?: string): FolderMeta[] {
 
 export function deleteFolderMeta(folderId: string): boolean {
   if (!isValidFolderId(folderId)) return false;
-  const p = getFolderMetaPath(folderId);
+  let p: string;
+  try {
+    p = safeFolderMetaPath(folderId);
+  } catch {
+    return false;
+  }
   if (!fs.existsSync(p)) return false;
   fs.unlinkSync(p);
   return true;
@@ -242,6 +252,17 @@ export function purgeExpiredFiles(): number {
 }
 
 export function splitAndSaveFromPath(fileId: string, tempPath: string): number {
+  // SEC: boundary check — tempPath must reside within uploadsDir to prevent
+  // a path-traversal attack if the caller were ever to pass untrusted input.
+  const resolvedTemp = path.resolve(tempPath);
+  const resolvedUploads = path.resolve(uploadsDir);
+  if (
+    resolvedTemp !== resolvedUploads &&
+    !resolvedTemp.startsWith(resolvedUploads + path.sep)
+  ) {
+    throw new Error("Security violation: tempPath is outside the uploads directory");
+  }
+
   const dir = getFileDir(fileId);
   fs.mkdirSync(dir, { recursive: true });
 

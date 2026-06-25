@@ -54,7 +54,7 @@
     "framer-motion": "^12.9.4",
     "helmet": "^8.0.0",
     "lucide-react": "^0.487.0",
-    "multer": "^2.0.0",
+    "multer": "^2.0.1",
     "pino": "^9.0.0",
     "pino-http": "^10.0.0",
     "pino-pretty": "^11.3.0",
