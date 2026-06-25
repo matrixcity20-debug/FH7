@@ -39,6 +39,12 @@ import {
   testE2Connectivity,
 } from "../lib/e2Storage.js";
 import { storageHealthMonitor } from "../lib/storageHealthMonitor.js";
+import {
+  isGDriveOAuthConfigured,
+  listAuthorizedAccounts,
+  revokeAccount,
+  testGDriveConnectivity,
+} from "../lib/gdriveStorage.js";
 
 const router: IRouter = Router();
 
@@ -518,7 +524,7 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
 
     const bucketBreakdown: Record<
       string,
-      { fileCount: number; totalBytes: number; provider: "r2" | "b2" | "e2" | "unknown" }
+      { fileCount: number; totalBytes: number; provider: "r2" | "b2" | "e2" | "gdrive" | "unknown" }
     > = {};
     const files: Array<{
       fileId: string;
@@ -527,7 +533,7 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       mimeType: string;
       userId: string | undefined;
       chunkCount: number;
-      provider: "r2" | "b2" | "e2" | "unknown";
+      provider: "r2" | "b2" | "e2" | "gdrive" | "unknown";
       bucket: string;
       encrypted: boolean;
       uploadedAt: string;
@@ -548,7 +554,7 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       const cloudStatus = record.cloudUpload?.status ?? "legacy";
       const isReady = cloudStatus === "ready" || cloudStatus === "legacy";
 
-      const provider: "r2" | "b2" | "e2" | "unknown" = record.r2?.provider ?? "unknown";
+      const provider: "r2" | "b2" | "e2" | "gdrive" | "unknown" = record.r2?.provider ?? "unknown";
       const bucket = record.r2?.bucket ?? "pending";
       const size = record.meta.size ?? 0;
       // SEC: encryptionKeyHex asla dışarı verilmez — yalnızca boolean flag
@@ -639,6 +645,64 @@ router.get("/admin/storage/health", requireAdmin, adminLimiter, (req, res): void
   );
 
   res.json(snapshot);
+});
+
+// ── Google Drive Yönetimi ─────────────────────────────────────────────────────
+
+// GET /api/admin/gdrive/accounts
+// Yetkilendirilmiş Google Drive hesaplarını listeler.
+// Refresh token asla döndürülmez.
+router.get("/admin/gdrive/accounts", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  try {
+    const oauthConfigured = isGDriveOAuthConfigured();
+    const accounts = oauthConfigured ? await listAuthorizedAccounts() : [];
+    res.json({
+      oauthConfigured,
+      accounts,
+    });
+  } catch (err) {
+    req.log.error({ err }, "Admin gdrive listAccounts error");
+    res.status(500).json({ error: "Google Drive hesapları listelenemedi" });
+  }
+});
+
+// POST /api/admin/gdrive/accounts/:email/test
+// Belirtilen hesabın Drive bağlantısını test eder.
+router.post("/admin/gdrive/accounts/:email/test", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  const { email } = req.params;
+  if (!email || typeof email !== "string" || email.length > 320) {
+    res.status(400).json({ error: "Geçersiz e-posta adresi" });
+    return;
+  }
+
+  try {
+    const result = await testGDriveConnectivity(decodeURIComponent(email));
+    req.log.info({ adminId: req.session.userId, email, ...result }, "Admin tested GDrive connection");
+    res.json(result);
+  } catch (err) {
+    req.log.error({ err, email }, "Admin gdrive test error");
+    res.status(500).json({ error: "Bağlantı testi başarısız", detail: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// DELETE /api/admin/gdrive/accounts/:email
+// Belirtilen Gmail hesabının yetkisini iptal eder.
+// Mevcut dosyalar üzerinde işlem yapmaz — sadece yeni yüklemeler için hesabı listeden çıkarır.
+router.delete("/admin/gdrive/accounts/:email", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  const { email } = req.params;
+  if (!email || typeof email !== "string" || email.length > 320) {
+    res.status(400).json({ error: "Geçersiz e-posta adresi" });
+    return;
+  }
+
+  try {
+    await revokeAccount(decodeURIComponent(email));
+    req.log.info({ adminId: req.session.userId, email }, "Admin revoked GDrive account");
+    res.json({ ok: true });
+  } catch (err) {
+    req.log.error({ err, email }, "Admin gdrive revoke error");
+    res.status(500).json({ error: "Hesap yetkisi kaldırılamadı" });
+  }
 });
 
 export default router;
