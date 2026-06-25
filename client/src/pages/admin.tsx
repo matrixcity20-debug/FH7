@@ -3,6 +3,7 @@ import {
   Users, Settings, RefreshCw, CheckCircle, AlertCircle,
   RotateCcw, ChevronDown, ChevronUp, Database, UploadCloud, Layers,
   Shield, Flag, Trash2, ExternalLink, XCircle, AlertTriangle, FileText,
+  HardDrive, Cloud, CloudOff, Lock, Wifi, WifiOff, BarChart3, ServerCrash,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
@@ -66,7 +67,46 @@ interface FileReport {
   tarih: string;
 }
 
-type Tab = "users" | "reports";
+// ── Depolama Tipleri ──────────────────────────────────────────────────────────
+
+interface BucketBreakdown {
+  fileCount: number;
+  totalBytes: number;
+  provider: "r2" | "b2" | "unknown";
+}
+
+interface StorageFileEntry {
+  fileId: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  userId: string | undefined;
+  chunkCount: number;
+  provider: "r2" | "b2" | "unknown";
+  bucket: string;
+  encrypted: boolean;
+  uploadedAt: string;
+  storageUploadedAt: string | undefined;
+  expiresAt: string | null;
+}
+
+interface StorageStats {
+  r2Configured: boolean;
+  b2Configured: boolean;
+  firebaseConnected: boolean;
+  configuredBuckets: string[];
+  b2Buckets: string[];
+  totals: {
+    fileCount: number;
+    totalBytes: number;
+    encryptedCount: number;
+    unencryptedCount: number;
+  };
+  bucketBreakdown: Record<string, BucketBreakdown>;
+  files: StorageFileEntry[];
+}
+
+type Tab = "users" | "reports" | "storage";
 
 function StorageBar({ used, total }: { used: number; total: number }) {
   const pct = Math.min(100, (used / Math.max(1, total)) * 100);
@@ -412,6 +452,305 @@ function ReportCard({
   );
 }
 
+// ── StoragePanel Bileşeni ─────────────────────────────────────────────────────
+
+function ProviderBadge({ provider }: { provider: "r2" | "b2" | "unknown" }) {
+  if (provider === "r2") {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-orange-500/10 border border-orange-500/30 text-orange-400">
+        <Cloud className="w-2.5 h-2.5" /> R2
+      </span>
+    );
+  }
+  if (provider === "b2") {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-red-500/10 border border-red-500/30 text-red-400">
+        <HardDrive className="w-2.5 h-2.5" /> B2
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono bg-muted border border-border text-muted-foreground">
+      ?
+    </span>
+  );
+}
+
+function StoragePanel() {
+  const [stats, setStats] = useState<StorageStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [expandedFiles, setExpandedFiles] = useState(false);
+
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/r2/stats", { credentials: "include" });
+      if (!res.ok) {
+        const data = await res.json() as { error?: string };
+        setError(data.error ?? "İstatistikler alınamadı");
+        return;
+      }
+      setStats(await res.json() as StorageStats);
+    } catch {
+      setError("Sunucuya ulaşılamadı");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  if (loading) {
+    return (
+      <div className="space-y-3">
+        {[...Array(3)].map((_, i) => (
+          <div key={i} className="h-24 rounded-xl border border-border bg-card/60 animate-pulse" />
+        ))}
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center gap-3 py-16 border border-dashed border-destructive/30 rounded-xl">
+        <ServerCrash className="w-8 h-8 text-destructive/50" />
+        <p className="text-sm font-mono text-destructive">{error}</p>
+        <Button variant="outline" size="sm" className="text-xs font-mono gap-2" onClick={() => load()}>
+          <RefreshCw className="w-3.5 h-3.5" /> Tekrar Dene
+        </Button>
+      </div>
+    );
+  }
+
+  if (!stats) return null;
+
+  const bucketEntries = Object.entries(stats.bucketBreakdown);
+  const encryptionPct = stats.totals.fileCount > 0
+    ? Math.round((stats.totals.encryptedCount / stats.totals.fileCount) * 100)
+    : 0;
+
+  return (
+    <div className="space-y-5">
+      {/* Yenile butonu */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground">
+          <BarChart3 className="w-3.5 h-3.5" />
+          <span>Firebase kayıtlarından okunur — bulut servislerine ayrıca istek gönderilmez</span>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="text-xs font-mono gap-2"
+          onClick={() => load(true)}
+        >
+          <RefreshCw className="w-3 h-3" /> Yenile
+        </Button>
+      </div>
+
+      {/* Servis Durum Kartları */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {/* Cloudflare R2 */}
+        <div className={`p-4 rounded-xl border flex items-center gap-3 ${stats.r2Configured ? "border-orange-500/30 bg-orange-500/5" : "border-border/60 bg-card/40"}`}>
+          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${stats.r2Configured ? "bg-orange-500/15 border border-orange-500/30" : "bg-muted border border-border"}`}>
+            {stats.r2Configured ? <Cloud className="w-4 h-4 text-orange-400" /> : <CloudOff className="w-4 h-4 text-muted-foreground" />}
+          </div>
+          <div>
+            <p className="text-xs font-mono font-bold text-foreground">Cloudflare R2</p>
+            <p className={`text-[11px] font-mono ${stats.r2Configured ? "text-orange-400" : "text-muted-foreground"}`}>
+              {stats.r2Configured
+                ? `${stats.configuredBuckets.length} bucket aktif`
+                : "Yapılandırılmamış"}
+            </p>
+          </div>
+          <div className="ml-auto">
+            {stats.r2Configured
+              ? <CheckCircle className="w-4 h-4 text-emerald-400" />
+              : <XCircle className="w-4 h-4 text-muted-foreground/40" />}
+          </div>
+        </div>
+
+        {/* Backblaze B2 */}
+        <div className={`p-4 rounded-xl border flex items-center gap-3 ${stats.b2Configured ? "border-red-500/30 bg-red-500/5" : "border-border/60 bg-card/40"}`}>
+          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${stats.b2Configured ? "bg-red-500/15 border border-red-500/30" : "bg-muted border border-border"}`}>
+            {stats.b2Configured ? <HardDrive className="w-4 h-4 text-red-400" /> : <HardDrive className="w-4 h-4 text-muted-foreground" />}
+          </div>
+          <div>
+            <p className="text-xs font-mono font-bold text-foreground">Backblaze B2</p>
+            <p className={`text-[11px] font-mono ${stats.b2Configured ? "text-red-400" : "text-muted-foreground"}`}>
+              {stats.b2Configured
+                ? `${stats.b2Buckets.length} bucket aktif`
+                : "Yapılandırılmamış"}
+            </p>
+          </div>
+          <div className="ml-auto">
+            {stats.b2Configured
+              ? <CheckCircle className="w-4 h-4 text-emerald-400" />
+              : <XCircle className="w-4 h-4 text-muted-foreground/40" />}
+          </div>
+        </div>
+
+        {/* Firebase */}
+        <div className={`p-4 rounded-xl border flex items-center gap-3 ${stats.firebaseConnected ? "border-yellow-500/30 bg-yellow-500/5" : "border-border/60 bg-card/40"}`}>
+          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${stats.firebaseConnected ? "bg-yellow-500/15 border border-yellow-500/30" : "bg-muted border border-border"}`}>
+            {stats.firebaseConnected ? <Wifi className="w-4 h-4 text-yellow-400" /> : <WifiOff className="w-4 h-4 text-muted-foreground" />}
+          </div>
+          <div>
+            <p className="text-xs font-mono font-bold text-foreground">Firebase RTDB</p>
+            <p className={`text-[11px] font-mono ${stats.firebaseConnected ? "text-yellow-400" : "text-muted-foreground"}`}>
+              {stats.firebaseConnected ? "Bağlı" : "Bağlı değil"}
+            </p>
+          </div>
+          <div className="ml-auto">
+            {stats.firebaseConnected
+              ? <CheckCircle className="w-4 h-4 text-emerald-400" />
+              : <XCircle className="w-4 h-4 text-muted-foreground/40" />}
+          </div>
+        </div>
+      </div>
+
+      {/* Toplam İstatistikler */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[
+          { label: "Toplam Dosya", value: stats.totals.fileCount.toLocaleString("tr-TR"), icon: FileText },
+          { label: "Toplam Boyut", value: formatBytes(stats.totals.totalBytes), icon: Database },
+          { label: "Şifreli", value: `${stats.totals.encryptedCount} (${encryptionPct}%)`, icon: Lock },
+          { label: "Şifresiz", value: String(stats.totals.unencryptedCount), icon: AlertTriangle },
+        ].map(({ label, value, icon: Icon }) => (
+          <div key={label} className="p-3 rounded-xl border border-border/60 bg-card/60">
+            <div className="flex items-center gap-1.5 mb-1">
+              <Icon className="w-3 h-3 text-muted-foreground" />
+              <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider">{label}</p>
+            </div>
+            <p className="text-sm font-mono font-bold text-foreground">{value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Bucket Dağılımı */}
+      {bucketEntries.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-xs font-mono text-muted-foreground flex items-center gap-1.5">
+            <Layers className="w-3.5 h-3.5" /> Bucket Dağılımı
+          </p>
+          <div className="space-y-2">
+            {bucketEntries.map(([key, bd]) => {
+              const pct = stats.totals.totalBytes > 0
+                ? Math.min(100, (bd.totalBytes / stats.totals.totalBytes) * 100)
+                : 0;
+              return (
+                <div key={key} className="p-3 rounded-xl border border-border/60 bg-card/60">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <ProviderBadge provider={bd.provider} />
+                      <span className="text-xs font-mono text-foreground font-medium truncate">
+                        {key.replace(/^\[(r2|b2|unknown)\] /, "")}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0 ml-3">
+                      <span className="text-[11px] font-mono text-muted-foreground">
+                        {bd.fileCount} dosya
+                      </span>
+                      <span className="text-[11px] font-mono font-semibold text-foreground">
+                        {formatBytes(bd.totalBytes)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="h-1.5 w-full rounded-full bg-muted/60 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all ${bd.provider === "b2" ? "bg-red-400" : bd.provider === "r2" ? "bg-orange-400" : "bg-muted-foreground"}`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <p className="text-[10px] font-mono text-muted-foreground mt-1">
+                    Toplam boyutun %{pct.toFixed(1)}'i
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Dosya Listesi */}
+      {stats.files.length > 0 && (
+        <div className="space-y-2">
+          <button
+            className="flex items-center gap-2 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
+            onClick={() => setExpandedFiles((v) => !v)}
+          >
+            <FileText className="w-3.5 h-3.5" />
+            Tüm Dosyalar ({stats.files.length})
+            {expandedFiles ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          </button>
+
+          {expandedFiles && (
+            <div className="rounded-xl border border-border/60 overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-border/60 bg-muted/30">
+                      <th className="text-left px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Dosya Adı</th>
+                      <th className="text-left px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Servis</th>
+                      <th className="text-left px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Bucket</th>
+                      <th className="text-right px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Boyut</th>
+                      <th className="text-center px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Şifre</th>
+                      <th className="text-left px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Yüklenme</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stats.files.map((f, idx) => (
+                      <tr
+                        key={f.fileId}
+                        className={`border-b border-border/30 hover:bg-muted/20 transition-colors ${idx % 2 === 0 ? "" : "bg-muted/5"}`}
+                      >
+                        <td className="px-3 py-2.5 max-w-[200px]">
+                          <p className="truncate text-foreground font-medium">{f.name}</p>
+                          <p className="text-[10px] text-muted-foreground">{f.mimeType}</p>
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <ProviderBadge provider={f.provider} />
+                        </td>
+                        <td className="px-3 py-2.5 text-muted-foreground max-w-[120px]">
+                          <span className="truncate block">{f.bucket}</span>
+                        </td>
+                        <td className="px-3 py-2.5 text-right text-foreground whitespace-nowrap">
+                          {formatBytes(f.size)}
+                        </td>
+                        <td className="px-3 py-2.5 text-center">
+                          {f.encrypted
+                            ? <Lock className="w-3 h-3 text-emerald-400 mx-auto" />
+                            : <AlertTriangle className="w-3 h-3 text-destructive mx-auto" />}
+                        </td>
+                        <td className="px-3 py-2.5 text-muted-foreground whitespace-nowrap">
+                          {formatDate(f.uploadedAt)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {stats.totals.fileCount === 0 && (
+        <div className="text-center py-16 border border-dashed border-border/40 rounded-xl">
+          <HardDrive className="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
+          <p className="text-sm text-muted-foreground font-mono">Firebase'de kayıtlı dosya yok</p>
+          <p className="text-xs text-muted-foreground/60 font-mono mt-1">
+            Dosya yüklendikçe burada görünecek.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── AdminPage ─────────────────────────────────────────────────────────────────
+
 export default function AdminPage() {
   const { user } = useAuth();
   const [activeTab, setActiveTab] = useState<Tab>("users");
@@ -612,6 +951,17 @@ export default function AdminPage() {
             </span>
           )}
         </button>
+        <button
+          onClick={() => setActiveTab("storage")}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-mono transition-all ${
+            activeTab === "storage"
+              ? "bg-card border border-border/60 text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <HardDrive className="w-3.5 h-3.5" />
+          Depolama
+        </button>
       </div>
 
       {activeTab === "users" && (
@@ -649,6 +999,8 @@ export default function AdminPage() {
           )}
         </>
       )}
+
+      {activeTab === "storage" && <StoragePanel />}
 
       {activeTab === "reports" && (
         <>

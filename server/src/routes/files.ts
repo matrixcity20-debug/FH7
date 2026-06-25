@@ -50,13 +50,14 @@ import {
   type UploadSession,
 } from "../lib/uploadSessionStore.js";
 import {
-  isR2Configured,
+  isAnyStorageConfigured,
   generateEncryptionKey,
-  uploadChunkToR2,
-  downloadChunkFromR2,
-  deleteFileChunksFromR2,
-  pickUploadBucket,
-} from "../lib/r2Storage.js";
+  uploadChunkToStorage,
+  downloadChunkFromStorage,
+  deleteFileChunksFromStorage,
+  pickUploadTarget,
+  type StorageTarget,
+} from "../lib/storageProvider.js";
 import {
   saveFileRecord,
   getFileRecord,
@@ -268,22 +269,23 @@ async function checkUserQuota(
   };
 }
 
-// ── R2 Yardımcı Fonksiyonları ────────────────────────────────────────────────
+// ── Depolama Yardımcı Fonksiyonları ──────────────────────────────────────────
 
 /**
- * Yerel chunk'ları R2'ye şifreleyerek yükler ve kaydı Firebase'e yazar.
+ * Yerel chunk'ları bulut depolama servisine (R2 veya B2) şifreleyerek yükler
+ * ve kaydı Firebase'e yazar.
  * Background olarak çalışır — yanıt zaten gönderilmiştir.
- * Hata yerel dosyalara dokunmaz; R2 yedek katman olarak işlev görür.
+ * Hata yerel dosyalara dokunmaz; bulut depolama yedek katman olarak işlev görür.
  */
-async function uploadFileChunksToR2(
+async function uploadFileChunksToStorage(
   meta: FileMeta,
   log: Request["log"],
 ): Promise<void> {
-  if (!isR2Configured()) return;
+  if (!isAnyStorageConfigured()) return;
 
   const encryptionKey = generateEncryptionKey();
-  // Round-robin bucket seçimi — her dosya hangi bucket'a gittiğini Firebase'de taşır
-  const bucket = pickUploadBucket();
+  // Round-robin hedef seçimi — R2 ve B2 bucket'ları arasında dağıtım
+  const target: StorageTarget = pickUploadTarget();
 
   // Chunk'ları paralel yükle (en fazla 6 eşzamanlı — ağı sarmamak için)
   const CONCURRENCY = 6;
@@ -294,8 +296,11 @@ async function uploadFileChunksToR2(
         const i = start + j;
         const chunkPath = getChunkPath(meta.id, i);
         const data = fs.readFileSync(chunkPath);
-        return uploadChunkToR2(meta.id, i, data, encryptionKey, bucket).catch((err: unknown) => {
-          log.error({ err, fileId: meta.id, chunkIndex: i, bucket }, "R2 chunk upload failed");
+        return uploadChunkToStorage(target, meta.id, i, data, encryptionKey).catch((err: unknown) => {
+          log.error(
+            { err, fileId: meta.id, chunkIndex: i, provider: target.provider, bucket: target.bucket },
+            "Storage chunk upload failed",
+          );
           throw err;
         });
       },
@@ -304,27 +309,31 @@ async function uploadFileChunksToR2(
   }
 
   const r2Info: R2FileInfo = {
-    bucket,
+    provider: target.provider,
+    bucket: target.bucket,
     encryptionKeyHex: encryptionKey.toString("hex"),
     chunkCount: meta.chunkCount,
     uploadedAt: new Date().toISOString(),
   };
 
   await saveFileRecord(meta, r2Info);
-  log.info({ fileId: meta.id, chunkCount: meta.chunkCount }, "File chunks uploaded to R2");
+  log.info(
+    { fileId: meta.id, chunkCount: meta.chunkCount, provider: target.provider, bucket: target.bucket },
+    "File chunks uploaded to storage",
+  );
 }
 
 /**
- * Eksik bir chunk'ı R2'den on-demand olarak geri yükler.
+ * Eksik bir chunk'ı bulut depolamadan (R2 veya B2) on-demand olarak geri yükler.
  * Başarılıysa chunk yerel diske yazılır ve `true` döner.
- * R2 yapılandırılmamışsa veya kayıt bulunamazsa `false` döner.
+ * Depolama servisi yapılandırılmamışsa veya kayıt bulunamazsa `false` döner.
  */
-async function tryRestoreChunkFromR2(
+async function tryRestoreChunkFromStorage(
   fileId: string,
   chunkIndex: number,
   log: Request["log"],
 ): Promise<boolean> {
-  if (!isR2Configured()) return false;
+  if (!isAnyStorageConfigured()) return false;
 
   try {
     const record = await getFileRecord(fileId);
@@ -336,25 +345,28 @@ async function tryRestoreChunkFromR2(
       return false;
     }
 
-    const bucket = record.r2.bucket;
-    log.info({ fileId, chunkIndex, bucket }, "Restoring chunk from R2");
-    const plaintext = await downloadChunkFromR2(fileId, chunkIndex, encryptionKey, bucket);
+    const target: StorageTarget = {
+      provider: record.r2.provider ?? "r2",
+      bucket: record.r2.bucket,
+    };
+    log.info({ fileId, chunkIndex, provider: target.provider, bucket: target.bucket }, "Restoring chunk from storage");
+    const plaintext = await downloadChunkFromStorage(target, fileId, chunkIndex, encryptionKey);
 
     const chunkPath = getChunkPath(fileId, chunkIndex);
     const dir = path.dirname(chunkPath);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(chunkPath, plaintext);
 
-    log.info({ fileId, chunkIndex, bytes: plaintext.length }, "Chunk restored from R2");
+    log.info({ fileId, chunkIndex, bytes: plaintext.length }, "Chunk restored from storage");
     return true;
   } catch (err) {
-    log.error({ err, fileId, chunkIndex }, "Failed to restore chunk from R2");
+    log.error({ err, fileId, chunkIndex }, "Failed to restore chunk from storage");
     return false;
   }
 }
 
 /**
- * Bir dosyanın tüm eksik chunk'larını R2'den toplu olarak geri yükler.
+ * Bir dosyanın tüm eksik chunk'larını bulut depolamadan (R2 veya B2) toplu olarak geri yükler.
  * Firebase kaydı TEK SEFERLE okunur (N chunk için N istek yerine 1 istek).
  * Download endpoint için kullanılır.
  * @returns Tüm chunk'lar sağlanabiliyorsa true
@@ -370,9 +382,9 @@ async function ensureAllChunksLocal(
   }
   if (missingIndices.length === 0) return true;
 
-  if (!isR2Configured()) return false;
+  if (!isAnyStorageConfigured()) return false;
 
-  // Firebase kaydını bir kere çek — bucket + anahtar
+  // Firebase kaydını bir kere çek — provider + bucket + anahtar
   const record = await getFileRecord(meta.id);
   if (!record?.r2?.encryptionKeyHex || !record.r2.bucket) return false;
 
@@ -382,18 +394,24 @@ async function ensureAllChunksLocal(
     return false;
   }
 
-  const bucket = record.r2.bucket;
+  const target: StorageTarget = {
+    provider: record.r2.provider ?? "r2",
+    bucket: record.r2.bucket,
+  };
 
   for (const i of missingIndices) {
     try {
-      log.info({ fileId: meta.id, chunkIndex: i, bucket }, "Restoring chunk from R2 (batch)");
-      const plaintext = await downloadChunkFromR2(meta.id, i, encryptionKey, bucket);
+      log.info(
+        { fileId: meta.id, chunkIndex: i, provider: target.provider, bucket: target.bucket },
+        "Restoring chunk from storage (batch)",
+      );
+      const plaintext = await downloadChunkFromStorage(target, meta.id, i, encryptionKey);
       const chunkPath = getChunkPath(meta.id, i);
       fs.mkdirSync(path.dirname(chunkPath), { recursive: true });
       fs.writeFileSync(chunkPath, plaintext);
       log.info({ fileId: meta.id, chunkIndex: i, bytes: plaintext.length }, "Chunk restored");
     } catch (err) {
-      log.error({ err, fileId: meta.id, chunkIndex: i }, "Failed to restore chunk from R2");
+      log.error({ err, fileId: meta.id, chunkIndex: i }, "Failed to restore chunk from storage");
       return false;
     }
   }
@@ -576,7 +594,7 @@ router.post(
 
       saveMeta(meta);
       // ── R2: chunk'ları arka planda yükle (yanıt gecikmesin)
-      void uploadFileChunksToR2(meta, req.log).catch((err: unknown) => {
+      void uploadFileChunksToStorage(meta, req.log).catch((err: unknown) => {
         req.log.error({ err, fileId }, "R2 background upload failed (simple)");
       });
       req.log.info({ fileId, name: meta.name, chunkCount }, "File uploaded");
@@ -876,7 +894,7 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
 
     saveMeta(meta);
     // ── R2: chunk'ları arka planda yükle (yanıt gecikmesin)
-    void uploadFileChunksToR2(meta, req.log).catch((err: unknown) => {
+    void uploadFileChunksToStorage(meta, req.log).catch((err: unknown) => {
       req.log.error({ err, fileId: meta.id }, "R2 background upload failed (finalize)");
     });
     // SEC-IDOR: release the uploadId → sessionID binding now that finalize is done
@@ -1056,21 +1074,29 @@ router.delete("/files/:fileId", requireAuth, async (req, res): Promise<void> => 
   }
 
   deleteFile(fileId);
-  // R2 + Firebase temizliği (best-effort, arka planda)
-  // Önce Firebase kaydından doğru bucket adını al, sonra sil
+  // Bulut depolama + Firebase temizliği (best-effort, arka planda)
+  // Firebase kaydından doğru provider + bucket adını al, sonra sil
   void (async () => {
     try {
       const record = await getFileRecord(fileId);
       if (record?.r2?.bucket) {
-        await deleteFileChunksFromR2(meta.id, meta.chunkCount, record.r2.bucket).catch(
-          (err: unknown) => req.log.warn({ err, fileId }, "R2 chunk deletion failed (non-fatal)"),
+        const target: StorageTarget = {
+          provider: record.r2.provider ?? "r2",
+          bucket: record.r2.bucket,
+        };
+        await deleteFileChunksFromStorage(target, meta.id, meta.chunkCount).catch(
+          (err: unknown) =>
+            req.log.warn(
+              { err, fileId, provider: target.provider, bucket: target.bucket },
+              "Storage chunk deletion failed (non-fatal)",
+            ),
         );
       }
       await deleteFileRecord(fileId).catch((err: unknown) =>
         req.log.warn({ err, fileId }, "Firebase record deletion failed (non-fatal)"),
       );
     } catch (err) {
-      req.log.warn({ err, fileId }, "R2/Firebase cleanup error (non-fatal)");
+      req.log.warn({ err, fileId }, "Storage/Firebase cleanup error (non-fatal)");
     }
   })();
   req.log.info({ fileId }, "File deleted");
@@ -1198,7 +1224,7 @@ router.get(
     const chunkPath = getChunkPath(fileId, chunkIndex);
     if (!fs.existsSync(chunkPath)) {
       // R2'den on-demand geri yükleme dene
-      const restored = await tryRestoreChunkFromR2(fileId, chunkIndex, req.log);
+      const restored = await tryRestoreChunkFromStorage(fileId, chunkIndex, req.log);
       if (!restored) {
         res.status(404).json({ error: "Chunk dosyası eksik ve R2'den geri yüklenemedi" });
         return;

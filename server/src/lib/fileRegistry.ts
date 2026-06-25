@@ -29,13 +29,18 @@ const FB_ROOT = "filesplit_files";
 // ── Arayüzler ─────────────────────────────────────────────────────────────────
 
 export interface R2FileInfo {
-  /** R2 bucket adı — hangi bucket'a yüklendiğini takip eder */
+  /**
+   * Depolama provider'ı — hangi servise yüklendiğini belirtir.
+   * Geriye dönük uyumluluk: eksikse "r2" varsayılır (eski kayıtlar).
+   */
+  provider?: "r2" | "b2";
+  /** Bucket adı — hangi bucket'a yüklendiğini takip eder */
   bucket: string;
   /** AES-256-GCM şifreleme anahtarı (hex, 64 karakter = 32 bayt) */
   encryptionKeyHex: string;
   /** Toplam chunk sayısı */
   chunkCount: number;
-  /** R2'ye yüklenme zamanı */
+  /** Servise yüklenme zamanı */
   uploadedAt: string;
 }
 

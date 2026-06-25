@@ -21,7 +21,7 @@ import {
   uploadsDir,
 } from "../lib/fileStore.js";
 import { getFirebaseDb } from "../lib/firebase.js";
-import { isR2Configured, listConfiguredBuckets } from "../lib/r2Storage.js";
+import { getStorageSummary } from "../lib/storageProvider.js";
 import { type FileRecord } from "../lib/fileRegistry.js";
 
 const router: IRouter = Router();
@@ -369,22 +369,23 @@ router.delete("/admin/reports/:reportId/file", requireAdmin, adminLimiter, async
 });
 
 // ── GET /api/admin/r2/stats ───────────────────────────────────────────────
-// R2 depolama istatistikleri: bucket başına dosya/boyut dağılımı, şifreleme
-// durumu, yapılandırma kontrolü. Firebase kayıtlarından okur; R2'ye ayrıca
-// istek göndermez (hızlı ve ücretsiz).
+// Depolama istatistikleri: R2 + B2 bucket başına dosya/boyut dağılımı,
+// şifreleme durumu, yapılandırma kontrolü. Firebase kayıtlarından okur;
+// R2/B2'ye ayrıca istek göndermez (hızlı ve ücretsiz).
 //
 // Güvenlik: şifreleme anahtarları (encryptionKeyHex) asla döndürülmez.
 // Yalnızca "şifreli mi?" (boolean) bilgisi verilir.
 router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
-  const r2Configured = isR2Configured();
-  const configuredBuckets = listConfiguredBuckets();
+  const storage = getStorageSummary();
   const db = getFirebaseDb();
 
   if (!db) {
     res.json({
-      r2Configured,
+      r2Configured: storage.r2Configured,
+      b2Configured: storage.b2Configured,
       firebaseConnected: false,
-      configuredBuckets,
+      configuredBuckets: storage.r2Buckets,
+      b2Buckets: storage.b2Buckets,
       totals: { fileCount: 0, totalBytes: 0, encryptedCount: 0, unencryptedCount: 0 },
       bucketBreakdown: {},
       files: [],
@@ -398,9 +399,11 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
 
     if (!records) {
       res.json({
-        r2Configured,
+        r2Configured: storage.r2Configured,
+        b2Configured: storage.b2Configured,
         firebaseConnected: true,
-        configuredBuckets,
+        configuredBuckets: storage.r2Buckets,
+        b2Buckets: storage.b2Buckets,
         totals: { fileCount: 0, totalBytes: 0, encryptedCount: 0, unencryptedCount: 0 },
         bucketBreakdown: {},
         files: [],
@@ -408,7 +411,10 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       return;
     }
 
-    const bucketBreakdown: Record<string, { fileCount: number; totalBytes: number }> = {};
+    const bucketBreakdown: Record<
+      string,
+      { fileCount: number; totalBytes: number; provider: "r2" | "b2" | "unknown" }
+    > = {};
     const files: Array<{
       fileId: string;
       name: string;
@@ -416,10 +422,11 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       mimeType: string;
       userId: string | undefined;
       chunkCount: number;
+      provider: "r2" | "b2" | "unknown";
       bucket: string;
       encrypted: boolean;
       uploadedAt: string;
-      r2UploadedAt: string | undefined;
+      storageUploadedAt: string | undefined;
       expiresAt: string | null;
     }> = [];
     let totalBytes = 0;
@@ -428,16 +435,18 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
     for (const [fileId, record] of Object.entries(records)) {
       if (!record?.meta?.id) continue;
 
+      const provider: "r2" | "b2" | "unknown" = record.r2?.provider ?? "r2";
       const bucket = record.r2?.bucket ?? "unknown";
       const size = record.meta.size ?? 0;
       // SEC: encryptionKeyHex asla dışarı verilmez — yalnızca boolean flag
       const encrypted = !!(record.r2?.encryptionKeyHex);
 
-      if (!bucketBreakdown[bucket]) {
-        bucketBreakdown[bucket] = { fileCount: 0, totalBytes: 0 };
+      const breakdownKey = `[${provider}] ${bucket}`;
+      if (!bucketBreakdown[breakdownKey]) {
+        bucketBreakdown[breakdownKey] = { fileCount: 0, totalBytes: 0, provider };
       }
-      bucketBreakdown[bucket].fileCount++;
-      bucketBreakdown[bucket].totalBytes += size;
+      bucketBreakdown[breakdownKey].fileCount++;
+      bucketBreakdown[breakdownKey].totalBytes += size;
       totalBytes += size;
       if (encrypted) encryptedCount++;
 
@@ -448,22 +457,25 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
         mimeType: record.meta.mimeType,
         userId: record.meta.userId,
         chunkCount: record.meta.chunkCount,
+        provider,
         bucket,
         encrypted,
         uploadedAt: record.meta.uploadedAt,
-        r2UploadedAt: record.r2?.uploadedAt,
+        storageUploadedAt: record.r2?.uploadedAt,
         expiresAt: record.meta.expiresAt ?? null,
       });
     }
 
     const fileCount = files.length;
 
-    req.log.info({ adminId: req.session.userId, fileCount }, "Admin viewed R2 stats");
+    req.log.info({ adminId: req.session.userId, fileCount }, "Admin viewed storage stats");
 
     res.json({
-      r2Configured,
+      r2Configured: storage.r2Configured,
+      b2Configured: storage.b2Configured,
       firebaseConnected: true,
-      configuredBuckets,
+      configuredBuckets: storage.r2Buckets,
+      b2Buckets: storage.b2Buckets,
       totals: {
         fileCount,
         totalBytes,
@@ -477,8 +489,8 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       ),
     });
   } catch (err) {
-    req.log.error({ err }, "Admin r2Stats error");
-    res.status(500).json({ error: "R2 istatistikleri alınamadı" });
+    req.log.error({ err }, "Admin storageStats error");
+    res.status(500).json({ error: "Depolama istatistikleri alınamadı" });
   }
 });
 
