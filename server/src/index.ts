@@ -6,6 +6,7 @@ import { purgeExpiredFiles, purgeStaleUploadDirs } from "./lib/fileStore.js";
 import { purgeStaleUploadSessions } from "./lib/uploadSessionStore.js";
 import { attachSignalingServer } from "./lib/signaling.js";
 import { restoreMetaFilesFromFirebase } from "./lib/fileRegistry.js";
+import { storageHealthMonitor } from "./lib/storageHealthMonitor.js";
 
 const rawPort = process.env["PORT"];
 
@@ -55,6 +56,15 @@ const staleSessions = purgeStaleUploadSessions();
 if (staleSessions > 0) logger.info({ staleSessions }, "Purged stale upload sessions on startup");
 const staleDirs = purgeStaleUploadDirs();
 if (staleDirs > 0) logger.info({ staleDirs }, "Purged stale upload dirs on startup");
+
+// ── Depolama sağlık izleyici ───────────────────────────────────────────────
+// Yapılandırılmış tüm provider'ları periyodik olarak test eder.
+// Interval: HEALTH_CHECK_INTERVAL_MS env (varsayılan: 5 dakika, min: 30 saniye).
+storageHealthMonitor.start();
+
+// Graceful shutdown: SIGTERM/SIGINT alındığında izleyiciyi durdur
+process.once("SIGTERM", () => storageHealthMonitor.stop());
+process.once("SIGINT", () => storageHealthMonitor.stop());
 
 // ── Hourly maintenance sweep ───────────────────────────────────────────────
 setInterval(

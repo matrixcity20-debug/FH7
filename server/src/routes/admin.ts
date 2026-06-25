@@ -38,6 +38,7 @@ import {
   listConfiguredE2Buckets,
   testE2Connectivity,
 } from "../lib/e2Storage.js";
+import { storageHealthMonitor } from "../lib/storageHealthMonitor.js";
 
 const router: IRouter = Router();
 
@@ -618,6 +619,26 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
     req.log.error({ err }, "Admin storageStats error");
     res.status(500).json({ error: "Depolama istatistikleri alınamadı" });
   }
+});
+
+// ── GET /api/admin/storage/health ────────────────────────────────────────────
+// Periyodik sağlık izleyicinin anlık sonuçlarını döndürür.
+// Gerçek zamanlı bucket durumunu (healthy / degraded / unknown), gecikme ve
+// zaman damgası bilgilerini içerir. Kimlik bilgisi asla dışarı verilmez.
+// Güvenlik: yalnızca admin erişimi; rate-limit uygulanır.
+router.get("/admin/storage/health", requireAdmin, adminLimiter, (req, res): void => {
+  const snapshot = storageHealthMonitor.getSnapshot();
+
+  req.log.info(
+    {
+      adminId: req.session.userId,
+      bucketCount: snapshot.records.length,
+      degraded: snapshot.records.filter((r) => r.status === "degraded").length,
+    },
+    "Admin viewed storage health",
+  );
+
+  res.json(snapshot);
 });
 
 export default router;
