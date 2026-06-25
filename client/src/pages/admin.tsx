@@ -476,14 +476,35 @@ function ProviderBadge({ provider }: { provider: "r2" | "b2" | "unknown" }) {
   );
 }
 
+interface BucketTestResult {
+  provider: "r2" | "b2";
+  bucket: string;
+  success: boolean;
+  latencyMs: number;
+  error?: string;
+}
+
+interface StorageTestResponse {
+  ok: boolean;
+  results: BucketTestResult[];
+}
+
 function StoragePanel() {
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedFiles, setExpandedFiles] = useState(false);
 
+  // Test state
+  const [testingR2, setTestingR2] = useState(false);
+  const [testingB2, setTestingB2] = useState(false);
+  const [testResults, setTestResults] = useState<BucketTestResult[] | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
+
   const load = async (silent = false) => {
-    if (!silent) setLoading(true);
+    if (silent) setRefreshing(true);
+    else setLoading(true);
     setError(null);
     try {
       const res = await fetch("/api/admin/r2/stats", { credentials: "include" });
@@ -497,6 +518,38 @@ function StoragePanel() {
       setError("Sunucuya ulaşılamadı");
     } finally {
       setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  const runTest = async (provider: "r2" | "b2" | "all") => {
+    const setTesting = provider === "r2" ? setTestingR2 : provider === "b2" ? setTestingB2 : (v: boolean) => { setTestingR2(v); setTestingB2(v); };
+    setTesting(true);
+    setTestResults(null);
+    setTestError(null);
+    try {
+      const res = await fetch("/api/admin/storage/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ provider }),
+      });
+      const data = await res.json() as StorageTestResponse & { error?: string };
+      if (!res.ok) {
+        setTestError(data.error ?? "Test başarısız");
+        return;
+      }
+      // Provider-specific tests: merge results (preserve previous other-provider results)
+      setTestResults((prev) => {
+        const incoming = data.results;
+        if (!prev || provider === "all") return incoming;
+        const otherProviderResults = prev.filter((r) => r.provider !== provider);
+        return [...otherProviderResults, ...incoming];
+      });
+    } catch {
+      setTestError("Sunucuya ulaşılamadı");
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -543,9 +596,11 @@ function StoragePanel() {
           variant="outline"
           size="sm"
           className="text-xs font-mono gap-2"
-          onClick={() => load(true)}
+          disabled={refreshing}
+          onClick={() => void load(true)}
         >
-          <RefreshCw className="w-3 h-3" /> Yenile
+          <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} />
+          {refreshing ? "Yenileniyor…" : "Yenile"}
         </Button>
       </div>
 
@@ -556,7 +611,7 @@ function StoragePanel() {
           <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${stats.r2Configured ? "bg-orange-500/15 border border-orange-500/30" : "bg-muted border border-border"}`}>
             {stats.r2Configured ? <Cloud className="w-4 h-4 text-orange-400" /> : <CloudOff className="w-4 h-4 text-muted-foreground" />}
           </div>
-          <div>
+          <div className="flex-1 min-w-0">
             <p className="text-xs font-mono font-bold text-foreground">Cloudflare R2</p>
             <p className={`text-[11px] font-mono ${stats.r2Configured ? "text-orange-400" : "text-muted-foreground"}`}>
               {stats.r2Configured
@@ -564,7 +619,21 @@ function StoragePanel() {
                 : "Yapılandırılmamış"}
             </p>
           </div>
-          <div className="ml-auto">
+          <div className="flex items-center gap-2 shrink-0">
+            {stats.r2Configured && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-[10px] font-mono gap-1 text-orange-400 hover:text-orange-300 hover:bg-orange-500/10"
+                disabled={testingR2}
+                onClick={() => void runTest("r2")}
+              >
+                {testingR2
+                  ? <RefreshCw className="w-3 h-3 animate-spin" />
+                  : <UploadCloud className="w-3 h-3" />}
+                {testingR2 ? "Test…" : "Test"}
+              </Button>
+            )}
             {stats.r2Configured
               ? <CheckCircle className="w-4 h-4 text-emerald-400" />
               : <XCircle className="w-4 h-4 text-muted-foreground/40" />}
@@ -576,7 +645,7 @@ function StoragePanel() {
           <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${stats.b2Configured ? "bg-red-500/15 border border-red-500/30" : "bg-muted border border-border"}`}>
             {stats.b2Configured ? <HardDrive className="w-4 h-4 text-red-400" /> : <HardDrive className="w-4 h-4 text-muted-foreground" />}
           </div>
-          <div>
+          <div className="flex-1 min-w-0">
             <p className="text-xs font-mono font-bold text-foreground">Backblaze B2</p>
             <p className={`text-[11px] font-mono ${stats.b2Configured ? "text-red-400" : "text-muted-foreground"}`}>
               {stats.b2Configured
@@ -584,7 +653,21 @@ function StoragePanel() {
                 : "Yapılandırılmamış"}
             </p>
           </div>
-          <div className="ml-auto">
+          <div className="flex items-center gap-2 shrink-0">
+            {stats.b2Configured && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-[10px] font-mono gap-1 text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                disabled={testingB2}
+                onClick={() => void runTest("b2")}
+              >
+                {testingB2
+                  ? <RefreshCw className="w-3 h-3 animate-spin" />
+                  : <UploadCloud className="w-3 h-3" />}
+                {testingB2 ? "Test…" : "Test"}
+              </Button>
+            )}
             {stats.b2Configured
               ? <CheckCircle className="w-4 h-4 text-emerald-400" />
               : <XCircle className="w-4 h-4 text-muted-foreground/40" />}
@@ -596,7 +679,7 @@ function StoragePanel() {
           <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${stats.firebaseConnected ? "bg-yellow-500/15 border border-yellow-500/30" : "bg-muted border border-border"}`}>
             {stats.firebaseConnected ? <Wifi className="w-4 h-4 text-yellow-400" /> : <WifiOff className="w-4 h-4 text-muted-foreground" />}
           </div>
-          <div>
+          <div className="flex-1 min-w-0">
             <p className="text-xs font-mono font-bold text-foreground">Firebase RTDB</p>
             <p className={`text-[11px] font-mono ${stats.firebaseConnected ? "text-yellow-400" : "text-muted-foreground"}`}>
               {stats.firebaseConnected ? "Bağlı" : "Bağlı değil"}
@@ -609,6 +692,53 @@ function StoragePanel() {
           </div>
         </div>
       </div>
+
+      {/* Test Sonuçları */}
+      {testError && (
+        <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl border border-destructive/30 bg-destructive/5 text-xs font-mono text-destructive">
+          <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+          <span>{testError}</span>
+          <button className="ml-auto text-muted-foreground hover:text-foreground" onClick={() => setTestError(null)}>
+            <XCircle className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+      {testResults && testResults.length > 0 && (
+        <div className="rounded-xl border border-border/60 overflow-hidden">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-border/40 bg-muted/20">
+            <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
+              <UploadCloud className="w-3 h-3" /> Bağlantı Test Sonuçları
+            </p>
+            <button
+              className="text-[10px] font-mono text-muted-foreground hover:text-foreground transition-colors"
+              onClick={() => { setTestResults(null); setTestError(null); }}
+            >
+              Temizle
+            </button>
+          </div>
+          <div className="divide-y divide-border/30">
+            {testResults.map((r, i) => (
+              <div key={i} className={`flex items-center gap-3 px-3 py-2.5 ${r.success ? "" : "bg-destructive/3"}`}>
+                <ProviderBadge provider={r.provider} />
+                <span className="text-xs font-mono text-foreground flex-1 truncate">{r.bucket}</span>
+                <span className="text-[10px] font-mono text-muted-foreground shrink-0">{r.latencyMs} ms</span>
+                {r.success ? (
+                  <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                ) : (
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <XCircle className="w-3.5 h-3.5 text-destructive shrink-0" />
+                    {r.error && (
+                      <span className="text-[10px] font-mono text-destructive truncate max-w-[200px]" title={r.error}>
+                        {r.error}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Toplam İstatistikler */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -761,43 +891,43 @@ export default function AdminPage() {
   const [reports, setReports] = useState<FileReport[]>([]);
   const [reportsLoading, setReportsLoading] = useState(false);
 
-  const loadUsers = async (silent = false) => {
-    if (!silent) setLoading(true);
-    else setRefreshing(true);
+  // Kullanıcı + default limitleri çeker, state'e yazar.
+  // Yükleme göstergesi yönetimi loadAll'a bırakılmıştır.
+  const fetchUsers = async () => {
+    const [usersRes, defaultsRes] = await Promise.all([
+      fetch("/api/admin/users", { credentials: "include" }),
+      fetch("/api/admin/defaults", { credentials: "include" }),
+    ]);
+    if (usersRes.ok) setUsers(await usersRes.json() as AdminUser[]);
+    if (defaultsRes.ok) setDefaults(await defaultsRes.json() as ServerDefaults);
+  };
+
+  // Şikayetleri çeker, state'e yazar.
+  const fetchReports = async () => {
+    const res = await fetch("/api/admin/reports", { credentials: "include" });
+    if (res.ok) setReports(await res.json() as FileReport[]);
+    else toast({ variant: "destructive", title: "Şikayetler yüklenemedi" });
+  };
+
+  // Tüm verileri çeker.
+  // silent=false → ilk yükleme göstergesi (loading/reportsLoading)
+  // silent=true  → sessiz yenileme (refreshing spinner)
+  const loadAll = async (silent = false) => {
+    if (silent) {
+      setRefreshing(true);
+    } else {
+      setLoading(true);
+      setReportsLoading(true);
+    }
     try {
-      const [usersRes, defaultsRes] = await Promise.all([
-        fetch("/api/admin/users", { credentials: "include" }),
-        fetch("/api/admin/defaults", { credentials: "include" }),
-      ]);
-      if (usersRes.ok) setUsers(await usersRes.json() as AdminUser[]);
-      if (defaultsRes.ok) setDefaults(await defaultsRes.json() as ServerDefaults);
+      await Promise.all([fetchUsers(), fetchReports()]);
     } catch {
-      toast({ variant: "destructive", title: "Kullanıcı verileri yüklenemedi" });
+      toast({ variant: "destructive", title: "Veriler yüklenemedi" });
     } finally {
       setLoading(false);
+      setReportsLoading(false);
       setRefreshing(false);
     }
-  };
-
-  const loadReports = async (silent = false) => {
-    if (!silent) setReportsLoading(true);
-    try {
-      const res = await fetch("/api/admin/reports", { credentials: "include" });
-      if (res.ok) setReports(await res.json() as FileReport[]);
-      else toast({ variant: "destructive", title: "Şikayetler yüklenemedi" });
-    } catch {
-      toast({ variant: "destructive", title: "Şikayetler yüklenemedi" });
-    } finally {
-      setReportsLoading(false);
-    }
-  };
-
-  const loadAll = async (silent = false) => {
-    if (!silent) { setLoading(true); setReportsLoading(true); }
-    else setRefreshing(true);
-    await Promise.all([loadUsers(true), loadReports(true)]);
-    if (!silent) { setLoading(false); setReportsLoading(false); }
-    else setRefreshing(false);
   };
 
   useEffect(() => { void loadAll(); }, []);
@@ -815,7 +945,7 @@ export default function AdminPage() {
       return;
     }
     toast({ title: "Limitler güncellendi ✓" });
-    await loadUsers(true);
+    await fetchUsers();
   };
 
   const handleReset = async (userId: string) => {
@@ -828,7 +958,7 @@ export default function AdminPage() {
       return;
     }
     toast({ title: "Limitler varsayılana döndürüldü" });
-    await loadUsers(true);
+    await fetchUsers();
   };
 
   const handleDismissReport = async (reportId: string) => {

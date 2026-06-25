@@ -18,8 +18,11 @@ import {
   DeleteObjectCommand,
   type GetObjectCommandOutput,
 } from "@aws-sdk/client-s3";
-import { encryptChunk, decryptChunk } from "./r2Storage.js";
+import { encryptChunk, decryptChunk, fileIdToStoragePath } from "./r2Storage.js";
 import { logger } from "./logger.js";
+
+/** Test bağlantı kontrolü için sabit B2 nesne yolu (yükle-sil döngüsü) */
+const B2_TEST_KEY = "files/_connectivity_check/test.bin";
 
 // ── Çoklu Bucket Yönetimi ─────────────────────────────────────────────────────
 
@@ -82,9 +85,9 @@ function getB2Client(): S3Client {
   });
 }
 
-/** B2 nesne yolu: files/{fileId}/chunk_{i}.enc */
+/** B2 nesne yolu: files/{sha256(fileId)}/chunk_{i}.enc */
 function b2Key(fileId: string, chunkIndex: number): string {
-  return `files/${fileId}/chunk_${chunkIndex}.enc`;
+  return `files/${fileIdToStoragePath(fileId)}/chunk_${chunkIndex}.enc`;
 }
 
 // ── B2 İşlemleri ──────────────────────────────────────────────────────────────
@@ -166,6 +169,33 @@ export async function downloadChunkFromB2(
   const encrypted = Buffer.concat(chunks);
 
   return decryptChunk(encrypted, encryptionKey);
+}
+
+/**
+ * B2 bucket bağlantısını test eder: küçük bir nesne yükler ve siler.
+ * @returns latencyMs ve hata varsa error string
+ */
+export async function testB2Connectivity(bucket: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
+  const client = getB2Client();
+  const start = Date.now();
+  const testBody = Buffer.from(`filesplit-connectivity-test-${Date.now()}`);
+  try {
+    await client.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: B2_TEST_KEY,
+      Body: testBody,
+      ContentType: "application/octet-stream",
+      ContentLength: testBody.length,
+    }));
+    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: B2_TEST_KEY }));
+    return { success: true, latencyMs: Date.now() - start };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 /**

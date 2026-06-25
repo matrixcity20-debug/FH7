@@ -23,6 +23,16 @@ import {
 import { getFirebaseDb } from "../lib/firebase.js";
 import { getStorageSummary } from "../lib/storageProvider.js";
 import { type FileRecord } from "../lib/fileRegistry.js";
+import {
+  isR2Configured,
+  listConfiguredBuckets as listR2Buckets,
+  testR2Connectivity,
+} from "../lib/r2Storage.js";
+import {
+  isB2Configured,
+  listConfiguredB2Buckets,
+  testB2Connectivity,
+} from "../lib/b2Storage.js";
 
 const router: IRouter = Router();
 
@@ -366,6 +376,74 @@ router.delete("/admin/reports/:reportId/file", requireAdmin, adminLimiter, async
 
   req.log.info({ adminId: req.session.userId, reportId, fileId }, "Admin closed report + deleted file");
   res.json({ ok: true, fileDeleted: !!meta });
+});
+
+// ── POST /api/admin/storage/test ──────────────────────────────────────────
+// R2 ve/veya B2 bucket'larına gerçek bir test dosyası yükler ve siler.
+// Bağlantı, kimlik doğrulaması ve bucket izinlerini doğrular.
+// body: { provider?: "r2" | "b2" | "all" }
+// Güvenlik: yalnızca admin erişimi; rate-limit uygulanır.
+router.post("/admin/storage/test", requireAdmin, adminLimiter, async (req, res): Promise<void> => {
+  const body = req.body as { provider?: string };
+  const targetProvider = (body.provider ?? "all").toLowerCase();
+
+  if (!["r2", "b2", "all"].includes(targetProvider)) {
+    res.status(400).json({ error: "Geçersiz provider değeri (r2, b2 veya all olmalı)" });
+    return;
+  }
+
+  interface BucketTestResult {
+    provider: "r2" | "b2";
+    bucket: string;
+    success: boolean;
+    latencyMs: number;
+    error?: string;
+  }
+
+  const tasks: Array<Promise<BucketTestResult>> = [];
+
+  // R2 testleri
+  if ((targetProvider === "r2" || targetProvider === "all") && isR2Configured()) {
+    for (const bucket of listR2Buckets()) {
+      tasks.push(
+        testR2Connectivity(bucket).then((r) => ({ provider: "r2" as const, bucket, ...r })),
+      );
+    }
+  }
+
+  // B2 testleri
+  if ((targetProvider === "b2" || targetProvider === "all") && isB2Configured()) {
+    for (const bucket of listConfiguredB2Buckets()) {
+      tasks.push(
+        testB2Connectivity(bucket).then((r) => ({ provider: "b2" as const, bucket, ...r })),
+      );
+    }
+  }
+
+  if (tasks.length === 0) {
+    res.status(400).json({
+      error:
+        targetProvider === "all"
+          ? "Hiç depolama servisi yapılandırılmamış"
+          : `${targetProvider.toUpperCase()} yapılandırılmamış`,
+    });
+    return;
+  }
+
+  try {
+    const results = await Promise.all(tasks);
+    const allOk = results.every((r) => r.success);
+
+    req.log.info(
+      { adminId: req.session.userId, results: results.map((r) => ({ provider: r.provider, bucket: r.bucket, success: r.success, latencyMs: r.latencyMs })) },
+      "Admin storage connectivity test",
+    );
+
+    res.json({ ok: allOk, results });
+  } catch (err) {
+    req.log.error({ err }, "Admin storage test error");
+    res.status(500).json({ error: "Test sırasında beklenmeyen hata oluştu" });
+  }
 });
 
 // ── GET /api/admin/r2/stats ───────────────────────────────────────────────

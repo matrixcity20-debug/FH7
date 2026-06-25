@@ -31,7 +31,7 @@ import {
   DeleteObjectCommand,
   type GetObjectCommandOutput,
 } from "@aws-sdk/client-s3";
-import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from "crypto";
 import { logger } from "./logger.js";
 
 // ── Sabitler ─────────────────────────────────────────────────────────────────
@@ -102,10 +102,22 @@ function getR2Client(): S3Client {
   });
 }
 
-/** R2 nesne yolu: files/{fileId}/chunk_{i}.enc */
-function r2Key(fileId: string, chunkIndex: number): string {
-  return `files/${fileId}/chunk_${chunkIndex}.enc`;
+/**
+ * fileId'nin SHA-256 özetini döner — bucket nesne yollarında
+ * UUID'lerin doğrudan görünmesini engeller; enumerate saldırılarını zorlaştırır.
+ * Deterministik: aynı fileId her zaman aynı hex'i üretir.
+ */
+export function fileIdToStoragePath(fileId: string): string {
+  return createHash("sha256").update(fileId, "utf8").digest("hex");
 }
+
+/** R2 nesne yolu: files/{sha256(fileId)}/chunk_{i}.enc */
+function r2Key(fileId: string, chunkIndex: number): string {
+  return `files/${fileIdToStoragePath(fileId)}/chunk_${chunkIndex}.enc`;
+}
+
+/** Test bağlantı kontrolü için sabit R2 nesne yolu (yükle-sil döngüsü) */
+export const R2_TEST_KEY = "files/_connectivity_check/test.bin";
 
 // ── Şifreleme / Çözme ─────────────────────────────────────────────────────────
 
@@ -228,6 +240,33 @@ export async function downloadChunkFromR2(
   const encrypted = Buffer.concat(chunks);
 
   return decryptChunk(encrypted, encryptionKey);
+}
+
+/**
+ * R2 bucket bağlantısını test eder: küçük bir nesne yükler ve siler.
+ * @returns latencyMs ve hata varsa error string
+ */
+export async function testR2Connectivity(bucket: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
+  const client = getR2Client();
+  const start = Date.now();
+  const testBody = Buffer.from(`filesplit-connectivity-test-${Date.now()}`);
+  try {
+    await client.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: R2_TEST_KEY,
+      Body: testBody,
+      ContentType: "application/octet-stream",
+      ContentLength: testBody.length,
+    }));
+    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: R2_TEST_KEY }));
+    return { success: true, latencyMs: Date.now() - start };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 /**
