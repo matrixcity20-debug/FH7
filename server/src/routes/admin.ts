@@ -506,27 +506,41 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
       uploadedAt: string;
       storageUploadedAt: string | undefined;
       expiresAt: string | null;
+      cloudStatus: "ready" | "pending" | "failed" | "legacy";
+      cloudError?: string;
     }> = [];
     let totalBytes = 0;
     let encryptedCount = 0;
+    let pendingCount = 0;
+    let failedCount = 0;
 
     for (const [fileId, record] of Object.entries(records)) {
       if (!record?.meta?.id) continue;
 
-      const provider: "r2" | "b2" | "unknown" = record.r2?.provider ?? "r2";
-      const bucket = record.r2?.bucket ?? "unknown";
+      // cloudUpload alanı olmayan eski kayıtlar "legacy" (= ready sayılır)
+      const cloudStatus = record.cloudUpload?.status ?? "legacy";
+      const isReady = cloudStatus === "ready" || cloudStatus === "legacy";
+
+      const provider: "r2" | "b2" | "unknown" = record.r2?.provider ?? "unknown";
+      const bucket = record.r2?.bucket ?? "pending";
       const size = record.meta.size ?? 0;
       // SEC: encryptionKeyHex asla dışarı verilmez — yalnızca boolean flag
-      const encrypted = !!(record.r2?.encryptionKeyHex);
+      const encrypted = isReady && !!(record.r2?.encryptionKeyHex);
 
-      const breakdownKey = `[${provider}] ${bucket}`;
-      if (!bucketBreakdown[breakdownKey]) {
-        bucketBreakdown[breakdownKey] = { fileCount: 0, totalBytes: 0, provider };
+      // Bucket breakdown sadece ready/legacy kayıtlar için hesaplanır
+      if (isReady && record.r2?.bucket) {
+        const breakdownKey = `[${provider}] ${bucket}`;
+        if (!bucketBreakdown[breakdownKey]) {
+          bucketBreakdown[breakdownKey] = { fileCount: 0, totalBytes: 0, provider };
+        }
+        bucketBreakdown[breakdownKey].fileCount++;
+        bucketBreakdown[breakdownKey].totalBytes += size;
       }
-      bucketBreakdown[breakdownKey].fileCount++;
-      bucketBreakdown[breakdownKey].totalBytes += size;
+
       totalBytes += size;
       if (encrypted) encryptedCount++;
+      if (cloudStatus === "pending") pendingCount++;
+      if (cloudStatus === "failed") failedCount++;
 
       files.push({
         fileId,
@@ -541,12 +555,17 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
         uploadedAt: record.meta.uploadedAt,
         storageUploadedAt: record.r2?.uploadedAt,
         expiresAt: record.meta.expiresAt ?? null,
+        cloudStatus: cloudStatus === "legacy" ? "ready" : cloudStatus,
+        ...(record.cloudUpload?.error ? { cloudError: record.cloudUpload.error } : {}),
       });
     }
 
     const fileCount = files.length;
 
-    req.log.info({ adminId: req.session.userId, fileCount }, "Admin viewed storage stats");
+    req.log.info(
+      { adminId: req.session.userId, fileCount, pendingCount, failedCount },
+      "Admin viewed storage stats",
+    );
 
     res.json({
       r2Configured: storage.r2Configured,
@@ -559,9 +578,10 @@ router.get("/admin/r2/stats", requireAdmin, adminLimiter, async (req, res): Prom
         totalBytes,
         encryptedCount,
         unencryptedCount: fileCount - encryptedCount,
+        pendingCount,
+        failedCount,
       },
       bucketBreakdown,
-      // En yeni yükleme en üstte
       files: files.sort(
         (a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime(),
       ),

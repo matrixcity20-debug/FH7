@@ -59,8 +59,11 @@ import {
   type StorageTarget,
 } from "../lib/storageProvider.js";
 import {
-  saveFileRecord,
+  createPendingFileRecord,
+  markFileRecordReady,
+  markFileRecordFailed,
   getFileRecord,
+  getReadyFileRecord,
   deleteFileRecord,
   type R2FileInfo,
 } from "../lib/fileRegistry.js";
@@ -272,11 +275,21 @@ async function checkUserQuota(
 // ── Depolama Yardımcı Fonksiyonları ──────────────────────────────────────────
 
 /**
- * Yerel chunk'ları bulut depolama servisine (R2 veya B2) şifreleyerek yükler
- * ve kaydı Firebase'e yazar.
- * Background olarak çalışır — yanıt zaten gönderilmiştir.
- * Hata yerel dosyalara dokunmaz; bulut depolama yedek katman olarak işlev görür.
+ * Yerel chunk'ları bulut depolama servisine (R2 veya B2) şifreleyerek yükler.
+ *
+ * Güvenilirlik garantileri:
+ *  - Firebase kaydı ÖNCE "pending" olarak oluşturulur → dosya hiçbir zaman kaybolmaz.
+ *  - Başarıda kaydı "ready" olarak günceller ve r2Info'yu yazar.
+ *  - Hata durumunda üstel geri çekilme ile en fazla MAX_UPLOAD_ATTEMPTS deneme yapar.
+ *  - Tüm denemeler başarısız olursa kaydı "failed" olarak günceller.
+ *    Dosya yerel disk'ten erişilebilir; bulut yedeği mevcut değil.
+ *
+ * Background olarak çalışır — istemciye yanıt zaten gönderilmiştir.
+ * Hata yerel dosyalara kesinlikle dokunmaz.
  */
+const MAX_UPLOAD_ATTEMPTS = 3;
+const UPLOAD_RETRY_BASE_MS = 2_000;
+
 async function uploadFileChunksToStorage(
   meta: FileMeta,
   log: Request["log"],
@@ -284,42 +297,71 @@ async function uploadFileChunksToStorage(
   if (!isAnyStorageConfigured()) return;
 
   const encryptionKey = generateEncryptionKey();
-  // Round-robin hedef seçimi — R2 ve B2 bucket'ları arasında dağıtım
   const target: StorageTarget = pickUploadTarget();
-
-  // Chunk'ları paralel yükle (en fazla 6 eşzamanlı — ağı sarmamak için)
   const CONCURRENCY = 6;
-  for (let start = 0; start < meta.chunkCount; start += CONCURRENCY) {
-    const batch = Array.from(
-      { length: Math.min(CONCURRENCY, meta.chunkCount - start) },
-      (_, j) => {
-        const i = start + j;
-        const chunkPath = getChunkPath(meta.id, i);
-        const data = fs.readFileSync(chunkPath);
-        return uploadChunkToStorage(target, meta.id, i, data, encryptionKey).catch((err: unknown) => {
-          log.error(
-            { err, fileId: meta.id, chunkIndex: i, provider: target.provider, bucket: target.bucket },
-            "Storage chunk upload failed",
-          );
-          throw err;
-        });
-      },
-    );
-    await Promise.all(batch);
+
+  let lastError = "";
+
+  for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
+    try {
+      // Chunk'ları paralel yükle (en fazla 6 eşzamanlı)
+      for (let start = 0; start < meta.chunkCount; start += CONCURRENCY) {
+        const batch = Array.from(
+          { length: Math.min(CONCURRENCY, meta.chunkCount - start) },
+          (_, j) => {
+            const i = start + j;
+            const chunkPath = getChunkPath(meta.id, i);
+            const data = fs.readFileSync(chunkPath);
+            return uploadChunkToStorage(target, meta.id, i, data, encryptionKey).catch(
+              (err: unknown) => {
+                log.warn(
+                  { err, fileId: meta.id, chunkIndex: i, provider: target.provider, bucket: target.bucket, attempt },
+                  "Chunk upload failed — will retry batch",
+                );
+                throw err;
+              },
+            );
+          },
+        );
+        await Promise.all(batch);
+      }
+
+      // Tüm chunk'lar başarıyla yüklendi
+      const r2Info: R2FileInfo = {
+        provider: target.provider,
+        bucket: target.bucket,
+        encryptionKeyHex: encryptionKey.toString("hex"),
+        chunkCount: meta.chunkCount,
+        uploadedAt: new Date().toISOString(),
+      };
+
+      await markFileRecordReady(meta.id, r2Info, attempt);
+      log.info(
+        { fileId: meta.id, chunkCount: meta.chunkCount, provider: target.provider, bucket: target.bucket, attempt },
+        "File chunks uploaded to storage — Firebase marked ready",
+      );
+      return;
+    } catch (err: unknown) {
+      lastError = err instanceof Error ? err.message : String(err);
+      log.error(
+        { err, fileId: meta.id, attempt, maxAttempts: MAX_UPLOAD_ATTEMPTS, provider: target.provider, bucket: target.bucket },
+        "Storage upload attempt failed",
+      );
+
+      if (attempt < MAX_UPLOAD_ATTEMPTS) {
+        // Üstel geri çekilme: 2s, 8s (2^1 * 2000, 2^2 * 2000)
+        const delay = UPLOAD_RETRY_BASE_MS * Math.pow(attempt, 2);
+        log.info({ fileId: meta.id, delayMs: delay, nextAttempt: attempt + 1 }, "Retrying storage upload");
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      }
+    }
   }
 
-  const r2Info: R2FileInfo = {
-    provider: target.provider,
-    bucket: target.bucket,
-    encryptionKeyHex: encryptionKey.toString("hex"),
-    chunkCount: meta.chunkCount,
-    uploadedAt: new Date().toISOString(),
-  };
-
-  await saveFileRecord(meta, r2Info);
-  log.info(
-    { fileId: meta.id, chunkCount: meta.chunkCount, provider: target.provider, bucket: target.bucket },
-    "File chunks uploaded to storage",
+  // Tüm denemeler tükendi — kaydı "failed" olarak işaretle
+  await markFileRecordFailed(meta.id, lastError, MAX_UPLOAD_ATTEMPTS);
+  log.error(
+    { fileId: meta.id, maxAttempts: MAX_UPLOAD_ATTEMPTS, provider: target.provider, bucket: target.bucket },
+    "All storage upload attempts exhausted — file accessible from local disk only",
   );
 }
 
@@ -336,7 +378,7 @@ async function tryRestoreChunkFromStorage(
   if (!isAnyStorageConfigured()) return false;
 
   try {
-    const record = await getFileRecord(fileId);
+    const record = await getReadyFileRecord(fileId);
     if (!record?.r2?.encryptionKeyHex) return false;
 
     const encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
@@ -384,8 +426,8 @@ async function ensureAllChunksLocal(
 
   if (!isAnyStorageConfigured()) return false;
 
-  // Firebase kaydını bir kere çek — provider + bucket + anahtar
-  const record = await getFileRecord(meta.id);
+  // Firebase kaydını bir kere çek — sadece "ready" kayıtlar kullanılır
+  const record = await getReadyFileRecord(meta.id);
   if (!record?.r2?.encryptionKeyHex || !record.r2.bucket) return false;
 
   const encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
@@ -593,9 +635,12 @@ router.post(
       };
 
       saveMeta(meta);
-      // ── R2: chunk'ları arka planda yükle (yanıt gecikmesin)
-      void uploadFileChunksToStorage(meta, req.log).catch((err: unknown) => {
-        req.log.error({ err, fileId }, "R2 background upload failed (simple)");
+      // Önce Firebase'e "pending" kaydı yaz — cloud upload başarısız olsa bile
+      // dosya kaydı asla kaybolmaz. Ardından arka planda yüklemeyi başlat.
+      void createPendingFileRecord(meta).then(() => {
+        void uploadFileChunksToStorage(meta, req.log).catch((err: unknown) => {
+          req.log.error({ err, fileId }, "Background storage upload failed (simple)");
+        });
       });
       req.log.info({ fileId, name: meta.name, chunkCount }, "File uploaded");
       res.status(201).json(meta);
@@ -893,9 +938,12 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     };
 
     saveMeta(meta);
-    // ── R2: chunk'ları arka planda yükle (yanıt gecikmesin)
-    void uploadFileChunksToStorage(meta, req.log).catch((err: unknown) => {
-      req.log.error({ err, fileId: meta.id }, "R2 background upload failed (finalize)");
+    // Önce Firebase'e "pending" kaydı yaz — cloud upload başarısız olsa bile
+    // dosya kaydı asla kaybolmaz. Ardından arka planda yüklemeyi başlat.
+    void createPendingFileRecord(meta).then(() => {
+      void uploadFileChunksToStorage(meta, req.log).catch((err: unknown) => {
+        req.log.error({ err, fileId: meta.id }, "Background storage upload failed (finalize)");
+      });
     });
     // SEC-IDOR: release the uploadId → sessionID binding now that finalize is done
     deleteSession(uploadId);

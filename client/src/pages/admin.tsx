@@ -88,6 +88,8 @@ interface StorageFileEntry {
   uploadedAt: string;
   storageUploadedAt: string | undefined;
   expiresAt: string | null;
+  cloudStatus: "ready" | "pending" | "failed";
+  cloudError?: string;
 }
 
 interface StorageStats {
@@ -101,6 +103,8 @@ interface StorageStats {
     totalBytes: number;
     encryptedCount: number;
     unencryptedCount: number;
+    pendingCount: number;
+    failedCount: number;
   };
   bucketBreakdown: Record<string, BucketBreakdown>;
   files: StorageFileEntry[];
@@ -743,10 +747,10 @@ function StoragePanel() {
       {/* Toplam İstatistikler */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {[
-          { label: "Toplam Dosya", value: stats.totals.fileCount.toLocaleString("tr-TR"), icon: FileText },
-          { label: "Toplam Boyut", value: formatBytes(stats.totals.totalBytes), icon: Database },
-          { label: "Şifreli", value: `${stats.totals.encryptedCount} (${encryptionPct}%)`, icon: Lock },
-          { label: "Şifresiz", value: String(stats.totals.unencryptedCount), icon: AlertTriangle },
+          { label: "Toplam Dosya", value: stats.totals.fileCount.toLocaleString("tr-TR"), icon: FileText, accent: "" },
+          { label: "Toplam Boyut", value: formatBytes(stats.totals.totalBytes), icon: Database, accent: "" },
+          { label: "Şifreli", value: `${stats.totals.encryptedCount} (${encryptionPct}%)`, icon: Lock, accent: "" },
+          { label: "Şifresiz", value: String(stats.totals.unencryptedCount), icon: AlertTriangle, accent: "" },
         ].map(({ label, value, icon: Icon }) => (
           <div key={label} className="p-3 rounded-xl border border-border/60 bg-card/60">
             <div className="flex items-center gap-1.5 mb-1">
@@ -757,6 +761,38 @@ function StoragePanel() {
           </div>
         ))}
       </div>
+
+      {/* Cloud Upload Durumu — sadece sorun varsa göster */}
+      {((stats.totals.pendingCount ?? 0) > 0 || (stats.totals.failedCount ?? 0) > 0) && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {(stats.totals.pendingCount ?? 0) > 0 && (
+            <div className="flex items-center gap-3 p-3 rounded-xl border border-yellow-500/30 bg-yellow-500/5">
+              <RefreshCw className="w-4 h-4 text-yellow-400 animate-spin shrink-0" />
+              <div>
+                <p className="text-xs font-mono font-semibold text-yellow-400">
+                  {stats.totals.pendingCount} dosya yükleniyor
+                </p>
+                <p className="text-[10px] font-mono text-muted-foreground">
+                  Bulut yedekleme devam ediyor
+                </p>
+              </div>
+            </div>
+          )}
+          {(stats.totals.failedCount ?? 0) > 0 && (
+            <div className="flex items-center gap-3 p-3 rounded-xl border border-destructive/30 bg-destructive/5">
+              <AlertCircle className="w-4 h-4 text-destructive shrink-0" />
+              <div>
+                <p className="text-xs font-mono font-semibold text-destructive">
+                  {stats.totals.failedCount} dosya bulut yedeği başarısız
+                </p>
+                <p className="text-[10px] font-mono text-muted-foreground">
+                  Dosyalar disk'ten erişilebilir, bulut yedek yok
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Bucket Dağılımı */}
       {bucketEntries.length > 0 && (
@@ -825,39 +861,52 @@ function StoragePanel() {
                       <th className="text-left px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Servis</th>
                       <th className="text-left px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Bucket</th>
                       <th className="text-right px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Boyut</th>
+                      <th className="text-center px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Bulut</th>
                       <th className="text-center px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Şifre</th>
                       <th className="text-left px-3 py-2 text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">Yüklenme</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {stats.files.map((f, idx) => (
-                      <tr
-                        key={f.fileId}
-                        className={`border-b border-border/30 hover:bg-muted/20 transition-colors ${idx % 2 === 0 ? "" : "bg-muted/5"}`}
-                      >
-                        <td className="px-3 py-2.5 max-w-[200px]">
-                          <p className="truncate text-foreground font-medium">{f.name}</p>
-                          <p className="text-[10px] text-muted-foreground">{f.mimeType}</p>
-                        </td>
-                        <td className="px-3 py-2.5">
-                          <ProviderBadge provider={f.provider} />
-                        </td>
-                        <td className="px-3 py-2.5 text-muted-foreground max-w-[120px]">
-                          <span className="truncate block">{f.bucket}</span>
-                        </td>
-                        <td className="px-3 py-2.5 text-right text-foreground whitespace-nowrap">
-                          {formatBytes(f.size)}
-                        </td>
-                        <td className="px-3 py-2.5 text-center">
-                          {f.encrypted
-                            ? <Lock className="w-3 h-3 text-emerald-400 mx-auto" />
-                            : <AlertTriangle className="w-3 h-3 text-destructive mx-auto" />}
-                        </td>
-                        <td className="px-3 py-2.5 text-muted-foreground whitespace-nowrap">
-                          {formatDate(f.uploadedAt)}
-                        </td>
-                      </tr>
-                    ))}
+                    {stats.files.map((f, idx) => {
+                      const rowAccent =
+                        f.cloudStatus === "failed" ? "bg-destructive/5" :
+                        f.cloudStatus === "pending" ? "bg-yellow-500/5" :
+                        idx % 2 !== 0 ? "bg-muted/5" : "";
+                      return (
+                        <tr
+                          key={f.fileId}
+                          className={`border-b border-border/30 hover:bg-muted/20 transition-colors ${rowAccent}`}
+                          title={f.cloudError ? `Hata: ${f.cloudError}` : undefined}
+                        >
+                          <td className="px-3 py-2.5 max-w-[200px]">
+                            <p className="truncate text-foreground font-medium">{f.name}</p>
+                            <p className="text-[10px] text-muted-foreground">{f.mimeType}</p>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <ProviderBadge provider={f.provider} />
+                          </td>
+                          <td className="px-3 py-2.5 text-muted-foreground max-w-[120px]">
+                            <span className="truncate block">{f.bucket}</span>
+                          </td>
+                          <td className="px-3 py-2.5 text-right text-foreground whitespace-nowrap">
+                            {formatBytes(f.size)}
+                          </td>
+                          <td className="px-3 py-2.5 text-center">
+                            {f.cloudStatus === "ready" && <CheckCircle className="w-3 h-3 text-emerald-400 mx-auto" />}
+                            {f.cloudStatus === "pending" && <RefreshCw className="w-3 h-3 text-yellow-400 animate-spin mx-auto" />}
+                            {f.cloudStatus === "failed" && <XCircle className="w-3 h-3 text-destructive mx-auto" title={f.cloudError} />}
+                          </td>
+                          <td className="px-3 py-2.5 text-center">
+                            {f.encrypted
+                              ? <Lock className="w-3 h-3 text-emerald-400 mx-auto" />
+                              : <AlertTriangle className="w-3 h-3 text-muted-foreground/40 mx-auto" />}
+                          </td>
+                          <td className="px-3 py-2.5 text-muted-foreground whitespace-nowrap">
+                            {formatDate(f.uploadedAt)}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
