@@ -297,7 +297,7 @@ async function uploadFileChunksToStorage(
   if (!isAnyStorageConfigured()) return;
 
   const encryptionKey = generateEncryptionKey();
-  const target: StorageTarget = pickUploadTarget();
+  const target: StorageTarget = await pickUploadTarget();
   const CONCURRENCY = 6;
 
   let lastError = "";
