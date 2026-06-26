@@ -4,7 +4,6 @@ import {
   RotateCcw, ChevronDown, ChevronUp, Database, UploadCloud, Layers,
   Shield, Flag, Trash2, ExternalLink, XCircle, AlertTriangle, FileText,
   HardDrive, Cloud, CloudOff, Lock, Wifi, WifiOff, BarChart3, ServerCrash,
-  FolderOpen, Plus, Unlink,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
@@ -113,7 +112,7 @@ interface StorageStats {
   files: StorageFileEntry[];
 }
 
-type Tab = "users" | "reports" | "storage" | "gdrive";
+type Tab = "users" | "reports" | "storage";
 
 function StorageBar({ used, total }: { used: number; total: number }) {
   const pct = Math.min(100, (used / Math.max(1, total)) * 100);
@@ -1128,290 +1127,6 @@ function StoragePanel() {
   );
 }
 
-// ── GDrivePanel Bileşeni ──────────────────────────────────────────────────────
-
-interface GDriveAccount {
-  email: string;
-  authorizedAt: string;
-}
-
-interface GDriveAccountsResponse {
-  oauthConfigured: boolean;
-  accounts: GDriveAccount[];
-}
-
-function GDrivePanel() {
-  const [data, setData] = useState<GDriveAccountsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [startingAuth, setStartingAuth] = useState(false);
-  const [testingEmails, setTestingEmails] = useState<Set<string>>(new Set());
-  const [revokingEmails, setRevokingEmails] = useState<Set<string>>(new Set());
-
-  const load = async () => {
-    setError(null);
-    try {
-      const res = await fetch("/api/admin/gdrive/accounts", { credentials: "include" });
-      if (!res.ok) {
-        const err = await res.json() as { error?: string };
-        setError(err.error ?? "Hesaplar yüklenemedi");
-        return;
-      }
-      setData(await res.json() as GDriveAccountsResponse);
-    } catch {
-      setError("Sunucuya ulaşılamadı");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { void load(); }, []);
-
-  // OAuth callback sonucunu URL hash'ten oku
-  useEffect(() => {
-    const hash = window.location.hash;
-    if (!hash.includes("gdrive=")) return;
-
-    const params = new URLSearchParams(hash.replace(/^.*\?/, ""));
-    const status = params.get("gdrive");
-    const emailParam = params.get("email");
-    const reason = params.get("reason");
-
-    if (status === "success" && emailParam) {
-      toast({ title: `Google Drive hesabı eklendi: ${emailParam}` });
-      void load();
-    } else if (status === "denied") {
-      toast({ variant: "destructive", title: "Google izni reddedildi" });
-    } else if (status === "error") {
-      toast({ variant: "destructive", title: `OAuth hatası: ${reason ?? "Bilinmeyen hata"}` });
-    }
-
-    // Hash'i temizle
-    if (status) {
-      window.history.replaceState(null, "", window.location.pathname + "#/admin");
-    }
-  }, []);
-
-  const handleAddAccount = async () => {
-    setStartingAuth(true);
-    try {
-      const res = await fetch("/api/auth/gdrive/start", { credentials: "include" });
-      const data = await res.json() as { url?: string; error?: string };
-      if (!res.ok || !data.url) {
-        toast({ variant: "destructive", title: data.error ?? "OAuth akışı başlatılamadı" });
-        return;
-      }
-      window.location.href = data.url;
-    } catch {
-      toast({ variant: "destructive", title: "Sunucuya ulaşılamadı" });
-    } finally {
-      setStartingAuth(false);
-    }
-  };
-
-  const handleTest = async (email: string) => {
-    setTestingEmails((s) => new Set(s).add(email));
-    try {
-      const res = await fetch(`/api/admin/gdrive/accounts/${encodeURIComponent(email)}/test`, {
-        method: "POST",
-        credentials: "include",
-      });
-      const result = await res.json() as { success?: boolean; latencyMs?: number; error?: string };
-      if (result.success) {
-        toast({ title: `Bağlantı başarılı — ${result.latencyMs ?? 0}ms (${email})` });
-      } else {
-        toast({ variant: "destructive", title: `Bağlantı başarısız: ${result.error ?? "Bilinmeyen hata"}` });
-      }
-    } catch {
-      toast({ variant: "destructive", title: "Test sırasında hata oluştu" });
-    } finally {
-      setTestingEmails((s) => { const n = new Set(s); n.delete(email); return n; });
-    }
-  };
-
-  const handleRevoke = async (email: string) => {
-    if (!window.confirm(`"${email}" hesabının yetkisini iptal etmek istediğinizden emin misiniz?`)) return;
-    setRevokingEmails((s) => new Set(s).add(email));
-    try {
-      const res = await fetch(`/api/admin/gdrive/accounts/${encodeURIComponent(email)}`, {
-        method: "DELETE",
-        credentials: "include",
-      });
-      if (!res.ok) {
-        const err = await res.json() as { error?: string };
-        toast({ variant: "destructive", title: err.error ?? "Yetki kaldırılamadı" });
-        return;
-      }
-      toast({ title: `"${email}" hesabı kaldırıldı` });
-      setData((prev) => prev ? { ...prev, accounts: prev.accounts.filter((a) => a.email !== email) } : prev);
-    } catch {
-      toast({ variant: "destructive", title: "Sunucuya ulaşılamadı" });
-    } finally {
-      setRevokingEmails((s) => { const n = new Set(s); n.delete(email); return n; });
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="space-y-3">
-        {[...Array(2)].map((_, i) => (
-          <div key={i} className="h-20 rounded-xl border border-border bg-card/60 animate-pulse" />
-        ))}
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="flex flex-col items-center gap-3 py-16 border border-dashed border-destructive/30 rounded-xl">
-        <AlertCircle className="w-8 h-8 text-destructive/50" />
-        <p className="text-sm font-mono text-destructive">{error}</p>
-        <Button variant="outline" size="sm" className="text-xs font-mono gap-2" onClick={() => void load()}>
-          <RefreshCw className="w-3.5 h-3.5" /> Tekrar Dene
-        </Button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-5">
-      {/* Başlık ve "Hesap Ekle" butonu */}
-      <div className="flex items-center justify-between">
-        <div className="space-y-0.5">
-          <div className="flex items-center gap-2">
-            <div className="w-6 h-6 rounded-md bg-blue-500/10 border border-blue-500/20 flex items-center justify-center">
-              <FolderOpen className="w-3.5 h-3.5 text-blue-400" />
-            </div>
-            <h2 className="text-sm font-mono font-bold">Google Drive Depolama</h2>
-          </div>
-          <p className="text-[11px] font-mono text-muted-foreground pl-8">
-            İzin verilen Gmail hesaplarının Drive'ları AES-256-GCM şifreli depolama olarak kullanılır.
-          </p>
-        </div>
-        <Button
-          size="sm"
-          className="text-xs font-mono gap-1.5"
-          disabled={startingAuth || !data?.oauthConfigured}
-          onClick={() => void handleAddAccount()}
-          title={!data?.oauthConfigured ? "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI ayarlanmamış" : undefined}
-        >
-          {startingAuth ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
-          {startingAuth ? "Yönlendiriliyor…" : "Hesap Ekle"}
-        </Button>
-      </div>
-
-      {/* OAuth yapılandırma durumu */}
-      {!data?.oauthConfigured && (
-        <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-500/5 flex items-start gap-3">
-          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-          <div className="space-y-1">
-            <p className="text-xs font-mono font-bold text-amber-400">OAuth Yapılandırılmamış</p>
-            <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
-              Google Drive eklemek için sunucuda şu ortam değişkenlerini ayarlayın:
-            </p>
-            <ul className="text-[11px] font-mono text-muted-foreground space-y-0.5 list-disc list-inside">
-              <li><code className="text-amber-400/80">GOOGLE_CLIENT_ID</code></li>
-              <li><code className="text-amber-400/80">GOOGLE_CLIENT_SECRET</code></li>
-              <li><code className="text-amber-400/80">GOOGLE_REDIRECT_URI</code> <span className="text-muted-foreground/60">(ör: https://sizin-domain.com/api/auth/gdrive/callback)</span></li>
-            </ul>
-            <p className="text-[11px] font-mono text-muted-foreground/70 mt-2">
-              Google Cloud Console → API &amp; Services → Credentials → OAuth 2.0 istemci kimliği oluşturun.
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Güvenlik notu */}
-      <div className="p-3 rounded-xl border border-emerald-500/20 bg-emerald-500/5 flex items-start gap-2.5">
-        <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
-        <div className="space-y-0.5">
-          <p className="text-[11px] font-mono font-bold text-emerald-400">Güvenlik Modeli</p>
-          <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
-            Yalnızca <code>drive.file</code> kapsamı istenir — uygulama yalnızca kendi oluşturduğu dosyalara erişir.
-            Refresh token'lar sunucuda (Firebase veya yerel dosya) şifresiz ancak istemciye hiç gönderilmeden saklanır.
-            Her chunk yüklemeden önce AES-256-GCM ile şifrelenir; şifreleme anahtarı Drive'a asla yazılmaz.
-          </p>
-        </div>
-      </div>
-
-      {/* Hesap listesi */}
-      {data?.accounts.length === 0 ? (
-        <div className="text-center py-16 border border-dashed border-border/40 rounded-xl">
-          <FolderOpen className="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
-          <p className="text-sm text-muted-foreground font-mono">Henüz yetkilendirilmiş Drive hesabı yok</p>
-          <p className="text-[11px] text-muted-foreground/60 font-mono mt-1">
-            "Hesap Ekle" butonu ile Gmail hesabı yetkilendirin.
-          </p>
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {data?.accounts.map((account) => {
-            const testing = testingEmails.has(account.email);
-            const revoking = revokingEmails.has(account.email);
-            return (
-              <div
-                key={account.email}
-                className="p-4 rounded-xl border border-blue-500/20 bg-blue-500/5 flex items-center gap-4"
-              >
-                {/* İkon */}
-                <div className="w-9 h-9 rounded-lg bg-blue-500/15 border border-blue-500/30 flex items-center justify-center shrink-0">
-                  <FolderOpen className="w-4 h-4 text-blue-400" />
-                </div>
-
-                {/* Bilgi */}
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-mono font-bold text-foreground truncate">{account.email}</p>
-                  <p className="text-[10px] font-mono text-muted-foreground">
-                    Yetkilendirildi: {account.authorizedAt
-                      ? format(new Date(account.authorizedAt), "d MMM yyyy, HH:mm", { locale: tr })
-                      : "—"}
-                  </p>
-                </div>
-
-                {/* Aksiyon butonları */}
-                <div className="flex items-center gap-2 shrink-0">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 px-2.5 text-[10px] font-mono gap-1 text-blue-400 hover:text-blue-300 hover:bg-blue-500/10"
-                    disabled={testing || revoking}
-                    onClick={() => void handleTest(account.email)}
-                  >
-                    {testing ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Wifi className="w-3 h-3" />}
-                    {testing ? "Test…" : "Test"}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 px-2.5 text-[10px] font-mono gap-1 text-destructive/70 hover:text-destructive hover:bg-destructive/10"
-                    disabled={testing || revoking}
-                    onClick={() => void handleRevoke(account.email)}
-                  >
-                    {revoking ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Unlink className="w-3 h-3" />}
-                    {revoking ? "Kaldırılıyor…" : "Kaldır"}
-                  </Button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Yenile */}
-      <div className="flex justify-end">
-        <Button
-          variant="outline"
-          size="sm"
-          className="text-xs font-mono gap-2"
-          onClick={() => { setLoading(true); void load(); }}
-        >
-          <RefreshCw className="w-3 h-3" /> Yenile
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 // ── AdminPage ─────────────────────────────────────────────────────────────────
 
 export default function AdminPage() {
@@ -1625,17 +1340,6 @@ export default function AdminPage() {
           <HardDrive className="w-3.5 h-3.5" />
           Depolama
         </button>
-        <button
-          onClick={() => setActiveTab("gdrive")}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-mono transition-all ${
-            activeTab === "gdrive"
-              ? "bg-card border border-border/60 text-foreground shadow-sm"
-              : "text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          <FolderOpen className="w-3.5 h-3.5" />
-          Google Drive
-        </button>
       </div>
 
       {activeTab === "users" && (
@@ -1675,8 +1379,6 @@ export default function AdminPage() {
       )}
 
       {activeTab === "storage" && <StoragePanel />}
-
-      {activeTab === "gdrive" && <GDrivePanel />}
 
       {activeTab === "reports" && (
         <>

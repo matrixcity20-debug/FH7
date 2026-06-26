@@ -1,7 +1,10 @@
 /**
  * Depolama Sağlık İzleyici — StorageHealthMonitor
  *
- * Yapılandırılmış tüm depolama sağlayıcılarını (R2, B2, e2) periyodik olarak test eder.
+ * Yapılandırılmış tüm depolama hedeflerini (R2, B2, e2 — tüm hesaplar) periyodik
+ * olarak test eder. Hedef listesi listAllTargets() ile alınır; her hedef kendi
+ * S3Client'ını taşıdığından çoklu hesap desteği otomatik olarak devreye girer.
+ *
  * Durum geçişlerini (healthy → degraded, degraded → healthy) loglar.
  *
  * Güvenlik notları:
@@ -13,20 +16,10 @@
 
 import { logger } from "./logger.js";
 import {
-  isR2Configured,
-  listConfiguredBuckets as listR2Buckets,
-  testR2Connectivity,
-} from "./r2Storage.js";
-import {
-  isB2Configured,
-  listConfiguredB2Buckets,
-  testB2Connectivity,
-} from "./b2Storage.js";
-import {
-  isE2Configured,
-  listConfiguredE2Buckets,
-  testE2Connectivity,
-} from "./e2Storage.js";
+  listAllTargets,
+  testStorageTargetConnectivity,
+  type StorageTarget,
+} from "./storageProvider.js";
 
 // ── Tipler ────────────────────────────────────────────────────────────────────
 
@@ -35,6 +28,7 @@ export type HealthStatus = "healthy" | "degraded" | "unknown";
 export interface BucketHealthRecord {
   provider: "r2" | "b2" | "e2";
   bucket: string;
+  accountIndex: number;
   status: HealthStatus;
   latencyMs: number | null;
   lastCheckedAt: string | null;
@@ -53,10 +47,10 @@ export interface StorageHealthSnapshot {
 
 // ── Sabitler ─────────────────────────────────────────────────────────────────
 
-const MIN_INTERVAL_MS = 30_000;          // 30 saniye minimum
-const DEFAULT_INTERVAL_MS = 5 * 60_000; // 5 dakika varsayılan
+const MIN_INTERVAL_MS = 30_000;           // 30 saniye minimum
+const DEFAULT_INTERVAL_MS = 5 * 60_000;  // 5 dakika varsayılan
 
-// Ardışık kaç başarısızlıktan sonra "degraded" olarak işaretlenir
+/** Ardışık kaç başarısızlıktan sonra "degraded" olarak işaretlenir */
 const DEGRADED_THRESHOLD = 1;
 
 // ── Singleton ─────────────────────────────────────────────────────────────────
@@ -112,32 +106,15 @@ class StorageHealthMonitor {
   // ── İç uygulama ─────────────────────────────────────────────────────────────
 
   private async runChecks(): Promise<void> {
-    const tasks: Array<Promise<void>> = [];
+    const targets = listAllTargets();
 
-    if (isR2Configured()) {
-      for (const bucket of listR2Buckets()) {
-        tasks.push(this.checkBucket("r2", bucket, testR2Connectivity));
-      }
-    }
-
-    if (isB2Configured()) {
-      for (const bucket of listConfiguredB2Buckets()) {
-        tasks.push(this.checkBucket("b2", bucket, testB2Connectivity));
-      }
-    }
-
-    if (isE2Configured()) {
-      for (const bucket of listConfiguredE2Buckets()) {
-        tasks.push(this.checkBucket("e2", bucket, testE2Connectivity));
-      }
-    }
-
-    if (tasks.length === 0) {
+    if (targets.length === 0) {
       logger.debug("StorageHealthMonitor: no configured providers — skipping check");
       return;
     }
 
-    // Bir provider'ın hatası diğerlerini etkilemesin
+    // Her hedef için bağlantı testi — bir provider'ın hatası diğerlerini etkilemez
+    const tasks = targets.map((target) => this.checkTarget(target));
     await Promise.allSettled(tasks);
 
     const now = new Date();
@@ -147,24 +124,20 @@ class StorageHealthMonitor {
     const degraded = Array.from(this.records.values()).filter((r) => r.status === "degraded");
     if (degraded.length > 0) {
       logger.warn(
-        { degraded: degraded.map((r) => `${r.provider}/${r.bucket}`) },
+        { degraded: degraded.map((r) => `${r.provider}[${r.accountIndex}]/${r.bucket}`) },
         "StorageHealthMonitor: degraded buckets detected",
       );
     }
   }
 
-  private async checkBucket(
-    provider: "r2" | "b2" | "e2",
-    bucket: string,
-    testFn: (bucket: string) => Promise<{ success: boolean; latencyMs: number; error?: string }>,
-  ): Promise<void> {
-    const key = `${provider}:${bucket}`;
+  private async checkTarget(target: StorageTarget): Promise<void> {
+    const key = `${target.provider}[${target.accountIndex}]:${target.bucket}`;
     const prev = this.records.get(key);
     const now = new Date().toISOString();
 
     let result: { success: boolean; latencyMs: number; error?: string };
     try {
-      result = await testFn(bucket);
+      result = await testStorageTargetConnectivity(target);
     } catch (err) {
       result = {
         success: false,
@@ -180,28 +153,40 @@ class StorageHealthMonitor {
     const status: HealthStatus = result.success
       ? "healthy"
       : consecutiveFailures >= DEGRADED_THRESHOLD
-      ? "degraded"
-      : "unknown";
+        ? "degraded"
+        : "unknown";
 
     // Durum geçişlerini logla
     const prevStatus = prev?.status ?? "unknown";
     if (prevStatus !== status) {
       if (status === "degraded") {
         logger.warn(
-          { provider, bucket, error: result.error, consecutiveFailures },
+          {
+            provider: target.provider,
+            bucket: target.bucket,
+            accountIndex: target.accountIndex,
+            error: result.error,
+            consecutiveFailures,
+          },
           "StorageHealthMonitor: bucket degraded",
         );
       } else if (status === "healthy" && prevStatus === "degraded") {
         logger.info(
-          { provider, bucket, latencyMs: result.latencyMs },
+          {
+            provider: target.provider,
+            bucket: target.bucket,
+            accountIndex: target.accountIndex,
+            latencyMs: result.latencyMs,
+          },
           "StorageHealthMonitor: bucket recovered",
         );
       }
     }
 
     this.records.set(key, {
-      provider,
-      bucket,
+      provider: target.provider,
+      bucket: target.bucket,
+      accountIndex: target.accountIndex,
       status,
       latencyMs: result.success ? result.latencyMs : null,
       lastCheckedAt: now,

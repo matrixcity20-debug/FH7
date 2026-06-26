@@ -1,27 +1,35 @@
 /**
  * Cloudflare R2 depolama istemcisi — AES-256-GCM şifreleme ile.
  *
- * Çoklu bucket desteği:
- *   R2_BUCKET_NAMES=bucket1,bucket2,bucket3   (virgülle ayrılmış liste)
- *   R2_BUCKET_NAME=tek-bucket                 (geriye dönük uyumluluk)
- *   İkisi de tanımlıysa R2_BUCKET_NAMES önceliklidir.
- *   Yükleme sırasında round-robin seçim yapılır.
- *   Her dosya kendi bucket adını Firebase'de taşır — indirme ve silme
- *   işlemleri her zaman doğru bucket'a gider.
+ * AWS S3 uyumlu API; Cloudflare S3 uyumluluk katmanı üzerinden erişilir.
  *
- * Şifreleme tasarımı:
- *   - Her dosya için 32 baytlık rastgele şifreleme anahtarı üretilir.
- *   - Her chunk için 12 baytlık rastgele IV üretilir ve ciphertext başına gömülür.
- *   - R2'de saklanan format: [IV(12 B) | ciphertext | authTag(16 B)]
- *   - Şifreleme anahtarı ASLA R2'ye yazılmaz; yalnızca Firebase RTDB'de saklanır.
- *   - R2 nesneleri sızdırılsa bile anahtar olmadan veri okunamaz.
+ * ── Çoklu Hesap Konfigürasyonu ───────────────────────────────────────────────
  *
- * Gerekli ortam değişkenleri:
- *   R2_ACCOUNT_ID        — Cloudflare hesap kimliği
- *   R2_ACCESS_KEY_ID     — R2 API token erişim anahtarı
- *   R2_SECRET_ACCESS_KEY — R2 API token gizli anahtarı
- *   R2_BUCKET_NAMES      — Virgülle ayrılmış bucket listesi (ör: "bucket-eu,bucket-us")
- *                          VEYA R2_BUCKET_NAME (tek bucket, geriye dönük)
+ *   Her env var, virgülle ayrılmış değer dizisi içerir.
+ *   Aynı konumdaki değerler bir hesabı tanımlar.
+ *
+ *   Örnek — 3 farklı Cloudflare hesabı:
+ *
+ *     R2_ACCOUNT_ID        = acct1,acct2,acct3
+ *     R2_ACCESS_KEY_ID     = key1,key2,key3
+ *     R2_SECRET_ACCESS_KEY = sec1,sec2,sec3
+ *     R2_BUCKET_NAMES      = bucketA|bucketB,bucket2,bucket3a|bucket3b
+ *
+ *   Hesap başına birden fazla bucket için `|` ayırıcısı kullanılır.
+ *   Tek bucket: R2_BUCKET_NAMES = mybucket (virgül/pipe gerekmez).
+ *
+ * ── Doğrulama ────────────────────────────────────────────────────────────────
+ *
+ *   Dizi uzunlukları eşleşmezse hata loglanır ve R2 tamamen devre dışı kalır.
+ *   Kısmi / tutarsız yapılandırma kabul edilmez.
+ *
+ * ── Güvenlik ─────────────────────────────────────────────────────────────────
+ *
+ *   - Şifreleme anahtarı asla R2'ye yazılmaz; yalnızca Firebase'de saklanır.
+ *   - Nesne yolları SHA-256 tabanlı; UUID'ler doğrudan görünmez (enumerate koruması).
+ *   - AES-256-GCM kimlik doğrulamalı şifreleme; bütünlük garantisi sağlar.
+ *   - Her chunk için bağımsız IV; aynı veri farklı ciphertext üretir.
+ *   - Kimlik bilgileri hiçbir log satırına yazılmaz.
  */
 
 import {
@@ -31,135 +39,233 @@ import {
   DeleteObjectCommand,
   type GetObjectCommandOutput,
 } from "@aws-sdk/client-s3";
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from "crypto";
+import crypto from "node:crypto";
 import { logger } from "./logger.js";
 
-// ── Sabitler ─────────────────────────────────────────────────────────────────
-const GCM_IV_BYTES = 12;
-const GCM_TAG_BYTES = 16;
-const MIN_ENCRYPTED_SIZE = GCM_IV_BYTES + GCM_TAG_BYTES + 1;
+/** Bağlantı testi için sabit nesne yolu (yükle-sil döngüsü) */
+const R2_TEST_KEY = "files/_connectivity_check/test.bin";
 
-// ── Çoklu Bucket Yönetimi ─────────────────────────────────────────────────────
+// ── Konfigürasyon Ayrıştırıcı ─────────────────────────────────────────────────
 
-let _bucketRoundRobinIndex = 0;
+export interface R2AccountConfig {
+  /** 1-tabanlı hesap numarası (1 = ilk giriş, 2 = ikinci, …) */
+  accountIndex: number;
+  accountId: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  buckets: string[];
+}
 
 /**
- * Yapılandırılmış tüm bucket adlarını döner.
- * R2_BUCKET_NAMES (virgülle ayrılmış) önceliklidir; yoksa R2_BUCKET_NAME kullanılır.
- * Hiç tanımlı değilse boş dizi döner.
+ * Virgülle ayrılmış env var değerini dizi olarak döner.
+ * Her değer baştaki ve sondaki boşluklardan arındırılır; boşlar atlanır.
  */
-export function listConfiguredBuckets(): string[] {
-  const multi = process.env["R2_BUCKET_NAMES"];
-  if (multi) {
-    return multi
-      .split(",")
+function parseCommaList(raw: string | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Bucket konfigürasyonunu ayrıştırır.
+ * Virgül → hesap sınırı; pipe → aynı hesap içinde birden fazla bucket.
+ *
+ * Örnek: "bucket1|bucket2,bucket3,bucket4|bucket5"
+ *   → [ ["bucket1","bucket2"], ["bucket3"], ["bucket4","bucket5"] ]
+ */
+function parseBucketGroups(raw: string | undefined): string[][] {
+  if (!raw?.trim()) return [];
+  return raw.split(",").map((segment) =>
+    segment
+      .split("|")
       .map((b) => b.trim())
-      .filter(Boolean);
-  }
-  const single = process.env["R2_BUCKET_NAME"];
-  return single ? [single] : [];
-}
-
-/**
- * Yükleme için bir bucket seçer (round-robin).
- * @throws Hiç bucket yapılandırılmamışsa hata fırlatır.
- */
-export function pickUploadBucket(): string {
-  const buckets = listConfiguredBuckets();
-  if (buckets.length === 0) {
-    throw new Error("R2 bucket tanımlı değil (R2_BUCKET_NAMES veya R2_BUCKET_NAME eksik)");
-  }
-  const bucket = buckets[_bucketRoundRobinIndex % buckets.length]!;
-  _bucketRoundRobinIndex = (_bucketRoundRobinIndex + 1) % buckets.length;
-  return bucket;
-}
-
-/**
- * R2'nin yapılandırılmış olup olmadığını kontrol eder.
- * Kimlik bilgileri + en az bir bucket gereklidir.
- */
-export function isR2Configured(): boolean {
-  return (
-    !!(
-      process.env["R2_ACCOUNT_ID"] &&
-      process.env["R2_ACCESS_KEY_ID"] &&
-      process.env["R2_SECRET_ACCESS_KEY"]
-    ) && listConfiguredBuckets().length > 0
+      .filter(Boolean),
   );
 }
 
-// ── R2 İstemcisi ──────────────────────────────────────────────────────────────
-
-function getR2Client(): S3Client {
-  const accountId = process.env["R2_ACCOUNT_ID"]!;
-  return new S3Client({
-    region: "auto",
-    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
-    credentials: {
-      accessKeyId: process.env["R2_ACCESS_KEY_ID"]!,
-      secretAccessKey: process.env["R2_SECRET_ACCESS_KEY"]!,
-    },
-  });
-}
-
 /**
- * fileId'nin SHA-256 özetini döner — bucket nesne yollarında
- * UUID'lerin doğrudan görünmesini engeller; enumerate saldırılarını zorlaştırır.
- * Deterministik: aynı fileId her zaman aynı hex'i üretir.
+ * Tüm yapılandırılmış R2 hesaplarını döner.
+ *
+ * Dizi uzunlukları eşleşmezse hata loglanır ve boş liste döner (fail-fast).
  */
-export function fileIdToStoragePath(fileId: string): string {
-  return createHash("sha256").update(fileId, "utf8").digest("hex");
+export function listR2Accounts(): R2AccountConfig[] {
+  const accountIds = parseCommaList(process.env["R2_ACCOUNT_ID"]);
+  const accessKeys = parseCommaList(process.env["R2_ACCESS_KEY_ID"]);
+  const secretKeys = parseCommaList(process.env["R2_SECRET_ACCESS_KEY"]);
+  const bucketGroups = parseBucketGroups(process.env["R2_BUCKET_NAMES"]);
+  const singleBucket = process.env["R2_BUCKET_NAME"]?.trim() ?? "";
+
+  // Hiç kimlik bilgisi yoksa yapılandırılmamış
+  if (accountIds.length === 0 && accessKeys.length === 0 && secretKeys.length === 0) {
+    return [];
+  }
+
+  // Temel kimlik bilgisi dizileri eşit uzunlukta olmalı
+  const credLengths = [accountIds.length, accessKeys.length, secretKeys.length];
+  const uniqueCredLengths = new Set(credLengths.filter((n) => n > 0));
+  if (uniqueCredLengths.size > 1) {
+    logger.error(
+      {
+        R2_ACCOUNT_ID: accountIds.length,
+        R2_ACCESS_KEY_ID: accessKeys.length,
+        R2_SECRET_ACCESS_KEY: secretKeys.length,
+      },
+      "R2 konfigürasyon hatası: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID ve " +
+        "R2_SECRET_ACCESS_KEY virgülle ayrılmış değer sayıları eşit olmalıdır. " +
+        "R2 tamamen devre dışı bırakılıyor.",
+    );
+    return [];
+  }
+
+  const accountCount = [...uniqueCredLengths][0] ?? 0;
+  if (accountCount === 0) return [];
+
+  // Bucket grubu tanımlanmışsa hesap sayısıyla eşleşmeli
+  if (bucketGroups.length > 0 && bucketGroups.length !== accountCount) {
+    logger.error(
+      { accounts: accountCount, bucketGroups: bucketGroups.length },
+      "R2 konfigürasyon hatası: R2_BUCKET_NAMES virgülle ayrılmış segment sayısı " +
+        "hesap sayısıyla eşleşmiyor. R2 tamamen devre dışı bırakılıyor.",
+    );
+    return [];
+  }
+
+  const accounts: R2AccountConfig[] = [];
+
+  for (let i = 0; i < accountCount; i++) {
+    const accountId = accountIds[i];
+    const accessKeyId = accessKeys[i];
+    const secretAccessKey = secretKeys[i];
+    if (!accountId || !accessKeyId || !secretAccessKey) continue;
+
+    const buckets =
+      bucketGroups.length > 0
+        ? (bucketGroups[i] ?? [])
+        : singleBucket
+          ? [singleBucket]
+          : [];
+
+    if (buckets.length === 0) {
+      logger.warn(
+        { accountIndex: i + 1 },
+        `R2 hesabı #${i + 1}: bucket tanımlanmamış, atlanıyor.`,
+      );
+      continue;
+    }
+
+    accounts.push({ accountIndex: i + 1, accountId, accessKeyId, secretAccessKey, buckets });
+  }
+
+  return accounts;
 }
 
-/** R2 nesne yolu: files/{sha256(fileId)}/chunk_{i}.enc */
-function r2Key(fileId: string, chunkIndex: number): string {
-  return `files/${fileIdToStoragePath(fileId)}/chunk_${chunkIndex}.enc`;
+/** R2'nin yapılandırılmış olup olmadığını kontrol eder. */
+export function isR2Configured(): boolean {
+  return listR2Accounts().length > 0;
 }
 
-/** Test bağlantı kontrolü için sabit R2 nesne yolu (yükle-sil döngüsü) */
-export const R2_TEST_KEY = "files/_connectivity_check/test.bin";
+/** Yapılandırılmış tüm R2 bucket adlarını döner (tüm hesaplar dahil). */
+export function listConfiguredBuckets(): string[] {
+  return listR2Accounts().flatMap((a) => a.buckets);
+}
 
-// ── Şifreleme / Çözme ─────────────────────────────────────────────────────────
+// ── S3 İstemci Önbelleği ──────────────────────────────────────────────────────
+
+const _r2ClientCache = new Map<string, S3Client>();
 
 /**
- * AES-256-GCM ile bir chunk'ı şifreler.
- * Çıktı formatı: [IV(12 B) | ciphertext | authTag(16 B)]
+ * R2AccountConfig için önbelleklenmiş S3Client döner.
+ * Aynı accountId+accessKeyId için tek istemci yeniden kullanılır.
+ */
+export function getR2ClientForAccount(config: R2AccountConfig): S3Client {
+  const cacheKey = `${config.accountId}::${config.accessKeyId}`;
+  if (!_r2ClientCache.has(cacheKey)) {
+    _r2ClientCache.set(
+      cacheKey,
+      new S3Client({
+        region: "auto",
+        endpoint: `https://${config.accountId}.r2.cloudflarestorage.com`,
+        credentials: {
+          accessKeyId: config.accessKeyId,
+          secretAccessKey: config.secretAccessKey,
+        },
+      }),
+    );
+  }
+  return _r2ClientCache.get(cacheKey)!;
+}
+
+/**
+ * Birincil (ilk) hesap için S3Client döner.
+ * @throws Hiç R2 hesabı yapılandırılmamışsa hata fırlatır.
+ */
+function getDefaultR2Client(): S3Client {
+  const accounts = listR2Accounts();
+  if (accounts.length === 0) {
+    throw new Error(
+      "R2 yapılandırılmamış " +
+        "(R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET_NAMES eksik)",
+    );
+  }
+  return getR2ClientForAccount(accounts[0]!);
+}
+
+// ── Şifreleme Yardımcıları ────────────────────────────────────────────────────
+
+/**
+ * Rasgele 256-bit şifreleme anahtarı üretir.
+ * Üretilen anahtar Firebase'de saklanır; R2'ye asla yazılmaz.
+ */
+export function generateEncryptionKey(): Buffer {
+  return crypto.randomBytes(32);
+}
+
+/**
+ * Plaintext chunk'ı AES-256-GCM ile şifreler.
+ * Format: [IV (12 B)] + [Auth Tag (16 B)] + [Ciphertext]
  */
 export function encryptChunk(plaintext: Buffer, key: Buffer): Buffer {
-  if (key.length !== 32) throw new Error("Encryption key must be 32 bytes");
-  const iv = randomBytes(GCM_IV_BYTES);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const authTag = cipher.getAuthTag();
-  return Buffer.concat([iv, ciphertext, authTag]);
+  return Buffer.concat([iv, authTag, ciphertext]);
 }
 
 /**
- * AES-256-GCM ile şifrelenmiş chunk'ı çözer.
- * Beklenen format: [IV(12 B) | ciphertext | authTag(16 B)]
- * @throws Bütünlük doğrulama başarısız olursa hata fırlatır.
+ * AES-256-GCM şifreli chunk'ı çözer.
+ * Format: [IV (12 B)] + [Auth Tag (16 B)] + [Ciphertext]
+ * @throws Bütünlük kontrolü başarısız olursa hata fırlatır.
  */
 export function decryptChunk(encrypted: Buffer, key: Buffer): Buffer {
-  if (key.length !== 32) throw new Error("Encryption key must be 32 bytes");
-  if (encrypted.length < MIN_ENCRYPTED_SIZE) {
-    throw new Error(`Encrypted data too short: ${encrypted.length} bytes`);
+  if (encrypted.length < 28) {
+    throw new Error(
+      "Şifreli veri çok kısa (en az 28 B gerekli: 12 B IV + 16 B Auth Tag)",
+    );
   }
-  const iv = encrypted.subarray(0, GCM_IV_BYTES);
-  const authTag = encrypted.subarray(encrypted.length - GCM_TAG_BYTES);
-  const ciphertext = encrypted.subarray(GCM_IV_BYTES, encrypted.length - GCM_TAG_BYTES);
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  // SEC: explicitly assert the expected tag length before supplying the tag.
-  // Without this, an attacker could submit a shorter truncated tag and the
-  // Node.js runtime would accept it — weakening authentication guarantees.
-  // setAuthTagLength must be called before setAuthTag.
-  decipher.setAuthTagLength(GCM_TAG_BYTES);
+  const iv = encrypted.subarray(0, 12);
+  const authTag = encrypted.subarray(12, 28);
+  const ciphertext = encrypted.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
-/** 256-bit (32 B) rastgele AES şifreleme anahtarı üretir. */
-export function generateEncryptionKey(): Buffer {
-  return randomBytes(32);
+/**
+ * Dosya kimliğini SHA-256 tabanlı nesne yoluna dönüştürür.
+ * UUID'ler doğrudan görünmez; enumerate saldırılarını önler.
+ */
+export function fileIdToStoragePath(fileId: string): string {
+  return crypto.createHash("sha256").update(fileId).digest("hex");
+}
+
+// ── Yol Yardımcısı ───────────────────────────────────────────────────────────
+
+/** R2 nesne yolu: files/{sha256(fileId)}/chunk_{i}.enc */
+function r2Key(fileId: string, chunkIndex: number): string {
+  return `files/${fileIdToStoragePath(fileId)}/chunk_${chunkIndex}.enc`;
 }
 
 // ── R2 İşlemleri ──────────────────────────────────────────────────────────────
@@ -167,7 +273,8 @@ export function generateEncryptionKey(): Buffer {
 /**
  * Bir chunk'ı şifreleyerek belirtilen R2 bucket'ına yükler.
  *
- * @param bucket  Hedef bucket adı (pickUploadBucket() sonucu)
+ * @param bucket  Hedef bucket adı
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
 export async function uploadChunkToR2(
   fileId: string,
@@ -175,11 +282,12 @@ export async function uploadChunkToR2(
   plaintext: Buffer,
   encryptionKey: Buffer,
   bucket: string,
+  client?: S3Client,
 ): Promise<void> {
-  const client = getR2Client();
+  const s3 = client ?? getDefaultR2Client();
   const encrypted = encryptChunk(plaintext, encryptionKey);
 
-  await client.send(
+  await s3.send(
     new PutObjectCommand({
       Bucket: bucket,
       Key: r2Key(fileId, chunkIndex),
@@ -198,18 +306,20 @@ export async function uploadChunkToR2(
  * Belirtilen R2 bucket'ından bir chunk'ı indirir ve şifresini çözer.
  *
  * @param bucket  Dosyanın saklandığı bucket (Firebase kaydından okunur)
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
 export async function downloadChunkFromR2(
   fileId: string,
   chunkIndex: number,
   encryptionKey: Buffer,
   bucket: string,
+  client?: S3Client,
 ): Promise<Buffer> {
-  const client = getR2Client();
+  const s3 = client ?? getDefaultR2Client();
 
   let response: GetObjectCommandOutput;
   try {
-    response = await client.send(
+    response = await s3.send(
       new GetObjectCommand({
         Bucket: bucket,
         Key: r2Key(fileId, chunkIndex),
@@ -237,28 +347,43 @@ export async function downloadChunkFromR2(
   for await (const piece of response.Body as AsyncIterable<Uint8Array>) {
     chunks.push(Buffer.from(piece));
   }
-  const encrypted = Buffer.concat(chunks);
-
-  return decryptChunk(encrypted, encryptionKey);
+  return decryptChunk(Buffer.concat(chunks), encryptionKey);
 }
 
 /**
  * R2 bucket bağlantısını test eder: küçük bir nesne yükler ve siler.
- * @returns latencyMs ve hata varsa error string
+ *
+ * @param bucket  Test edilecek bucket adı
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
-export async function testR2Connectivity(bucket: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
-  const client = getR2Client();
+export async function testR2Connectivity(
+  bucket: string,
+  client?: S3Client,
+): Promise<{ success: boolean; latencyMs: number; error?: string }> {
+  let s3: S3Client;
+  try {
+    s3 = client ?? getDefaultR2Client();
+  } catch (err: unknown) {
+    return {
+      success: false,
+      latencyMs: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
   const start = Date.now();
   const testBody = Buffer.from(`filesplit-connectivity-test-${Date.now()}`);
   try {
-    await client.send(new PutObjectCommand({
-      Bucket: bucket,
-      Key: R2_TEST_KEY,
-      Body: testBody,
-      ContentType: "application/octet-stream",
-      ContentLength: testBody.length,
-    }));
-    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: R2_TEST_KEY }));
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: R2_TEST_KEY,
+        Body: testBody,
+        ContentType: "application/octet-stream",
+        ContentLength: testBody.length,
+      }),
+    );
+    await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: R2_TEST_KEY }));
     return { success: true, latencyMs: Date.now() - start };
   } catch (err: unknown) {
     return {
@@ -270,27 +395,29 @@ export async function testR2Connectivity(bucket: string): Promise<{ success: boo
 }
 
 /**
- * Bir dosyanın tüm chunk'larını belirtilen bucket'tan siler (best-effort).
+ * Bir dosyanın tüm chunk'larını belirtilen R2 bucket'tan siler (best-effort).
  * Eksik nesneler görmezden gelinir; asla hata fırlatmaz.
  *
  * @param bucket  Dosyanın saklandığı bucket (Firebase kaydından okunur)
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
 export async function deleteFileChunksFromR2(
   fileId: string,
   chunkCount: number,
   bucket: string,
+  client?: S3Client,
 ): Promise<void> {
   if (!isR2Configured()) return;
-  const client = getR2Client();
+  let s3: S3Client;
+  try {
+    s3 = client ?? getDefaultR2Client();
+  } catch {
+    return;
+  }
 
   const deletions = Array.from({ length: chunkCount }, (_, i) =>
-    client
-      .send(
-        new DeleteObjectCommand({
-          Bucket: bucket,
-          Key: r2Key(fileId, i),
-        }),
-      )
+    s3
+      .send(new DeleteObjectCommand({ Bucket: bucket, Key: r2Key(fileId, i) }))
       .catch((err: unknown) => {
         logger.warn(
           { err, fileId, chunkIndex: i, bucket },

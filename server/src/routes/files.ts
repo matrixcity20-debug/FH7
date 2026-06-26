@@ -56,6 +56,7 @@ import {
   downloadChunkFromStorage,
   deleteFileChunksFromStorage,
   pickUploadTarget,
+  findStorageTargetByBucket,
   type StorageTarget,
 } from "../lib/storageProvider.js";
 import {
@@ -387,11 +388,14 @@ async function tryRestoreChunkFromStorage(
       return false;
     }
 
-    const target: StorageTarget = {
-      provider: record.r2.provider ?? "r2",
-      bucket: record.r2.bucket,
-    };
-    log.info({ fileId, chunkIndex, provider: target.provider, bucket: target.bucket }, "Restoring chunk from storage");
+    const provider = record.r2.provider ?? "r2";
+    const bucket = record.r2.bucket;
+    const target: StorageTarget | null = findStorageTargetByBucket(provider, bucket);
+    if (!target) {
+      log.error({ fileId, chunkIndex, provider, bucket }, "Chunk restore failed: no credentials for bucket");
+      return false;
+    }
+    log.info({ fileId, chunkIndex, provider: target.provider, bucket: target.bucket, accountIndex: target.accountIndex }, "Restoring chunk from storage");
     const plaintext = await downloadChunkFromStorage(target, fileId, chunkIndex, encryptionKey);
 
     const chunkPath = getChunkPath(fileId, chunkIndex);
@@ -436,10 +440,13 @@ async function ensureAllChunksLocal(
     return false;
   }
 
-  const target: StorageTarget = {
-    provider: record.r2.provider ?? "r2",
-    bucket: record.r2.bucket,
-  };
+  const resolvedProvider = record.r2.provider ?? "r2";
+  const resolvedBucket = record.r2.bucket;
+  const target: StorageTarget | null = findStorageTargetByBucket(resolvedProvider, resolvedBucket);
+  if (!target) {
+    log.error({ fileId: meta.id, provider: resolvedProvider, bucket: resolvedBucket }, "Chunk batch restore failed: no credentials for bucket");
+    return false;
+  }
 
   for (const i of missingIndices) {
     try {
@@ -1128,17 +1135,20 @@ router.delete("/files/:fileId", requireAuth, async (req, res): Promise<void> => 
     try {
       const record = await getFileRecord(fileId);
       if (record?.r2?.bucket) {
-        const target: StorageTarget = {
-          provider: record.r2.provider ?? "r2",
-          bucket: record.r2.bucket,
-        };
-        await deleteFileChunksFromStorage(target, meta.id, meta.chunkCount).catch(
-          (err: unknown) =>
-            req.log.warn(
-              { err, fileId, provider: target.provider, bucket: target.bucket },
-              "Storage chunk deletion failed (non-fatal)",
-            ),
-        );
+        const delProvider = record.r2.provider ?? "r2";
+        const delBucket = record.r2.bucket;
+        const target = findStorageTargetByBucket(delProvider, delBucket);
+        if (target) {
+          await deleteFileChunksFromStorage(target, meta.id, meta.chunkCount).catch(
+            (err: unknown) =>
+              req.log.warn(
+                { err, fileId, provider: target.provider, bucket: target.bucket, accountIndex: target.accountIndex },
+                "Storage chunk deletion failed (non-fatal)",
+              ),
+          );
+        } else {
+          req.log.warn({ fileId, provider: delProvider, bucket: delBucket }, "Storage chunk deletion skipped: no credentials for bucket");
+        }
       }
       await deleteFileRecord(fileId).catch((err: unknown) =>
         req.log.warn({ err, fileId }, "Firebase record deletion failed (non-fatal)"),

@@ -3,12 +3,33 @@
  *
  * B2, S3-uyumlu API sunduğu için AWS S3 SDK kullanılır.
  *
- * Gerekli ortam değişkenleri:
- *   B2_KEY_ID          — B2 Application Key ID (erişim anahtarı)
- *   B2_APP_KEY         — B2 Application Key (gizli anahtar)
- *   B2_ENDPOINT        — S3-uyumlu endpoint (ör: https://s3.us-west-004.backblazeb2.com)
- *   B2_BUCKET_NAMES    — Virgülle ayrılmış bucket listesi (ör: "bucket-a,bucket-b")
- *                        VEYA B2_BUCKET_NAME (tek bucket, geriye dönük uyumluluk)
+ * ── Çoklu Hesap Konfigürasyonu ───────────────────────────────────────────────
+ *
+ *   Her env var, virgülle ayrılmış değer dizisi içerir.
+ *   Aynı konumdaki değerler bir hesabı tanımlar.
+ *
+ *   Örnek — 3 farklı Backblaze hesabı:
+ *
+ *     B2_KEY_ID      = keyid1,keyid2,keyid3
+ *     B2_APP_KEY     = appkey1,appkey2,appkey3
+ *     B2_ENDPOINT    = https://s3.us-west-004.backblazeb2.com,...
+ *     B2_BUCKET_NAMES = bucketA|bucketB,bucket2,bucket3a|bucket3b
+ *
+ *   Hesap başına birden fazla bucket için `|` ayırıcısı kullanılır.
+ *   Tek bucket: B2_BUCKET_NAMES = mybucket (virgül/pipe gerekmez).
+ *
+ * ── Doğrulama ────────────────────────────────────────────────────────────────
+ *
+ *   Dizi uzunlukları eşleşmezse hata loglanır ve B2 tamamen devre dışı kalır.
+ *   Kısmi / tutarsız yapılandırma kabul edilmez.
+ *
+ * ── Güvenlik ─────────────────────────────────────────────────────────────────
+ *
+ *   - Şifreleme anahtarı asla B2'ye yazılmaz; yalnızca Firebase'de saklanır.
+ *   - Nesne yolları SHA-256 tabanlı; UUID'ler doğrudan görünmez (enumerate koruması).
+ *   - AES-256-GCM kimlik doğrulamalı şifreleme; bütünlük garantisi sağlar.
+ *   - Her chunk için bağımsız IV; aynı veri farklı ciphertext üretir.
+ *   - Kimlik bilgileri hiçbir log satırına yazılmaz.
  */
 
 import {
@@ -21,69 +42,177 @@ import {
 import { encryptChunk, decryptChunk, fileIdToStoragePath } from "./r2Storage.js";
 import { logger } from "./logger.js";
 
-/** Test bağlantı kontrolü için sabit B2 nesne yolu (yükle-sil döngüsü) */
+/** Bağlantı testi için sabit nesne yolu (yükle-sil döngüsü) */
 const B2_TEST_KEY = "files/_connectivity_check/test.bin";
 
-// ── Çoklu Bucket Yönetimi ─────────────────────────────────────────────────────
+// ── Konfigürasyon Ayrıştırıcı ─────────────────────────────────────────────────
 
-let _b2RoundRobinIndex = 0;
-
-/**
- * Yapılandırılmış tüm B2 bucket adlarını döner.
- * B2_BUCKET_NAMES (virgülle ayrılmış) önceliklidir; yoksa B2_BUCKET_NAME kullanılır.
- */
-export function listConfiguredB2Buckets(): string[] {
-  const multi = process.env["B2_BUCKET_NAMES"];
-  if (multi) {
-    return multi
-      .split(",")
-      .map((b) => b.trim())
-      .filter(Boolean);
-  }
-  const single = process.env["B2_BUCKET_NAME"];
-  return single ? [single] : [];
+export interface B2AccountConfig {
+  /** 1-tabanlı hesap numarası (1 = ilk giriş, 2 = ikinci, …) */
+  accountIndex: number;
+  keyId: string;
+  appKey: string;
+  endpoint: string;
+  buckets: string[];
 }
 
 /**
- * B2'nin yapılandırılmış olup olmadığını kontrol eder.
- * Kimlik bilgileri + endpoint + en az bir bucket gereklidir.
+ * Virgülle ayrılmış env var değerini dizi olarak döner.
+ * Her değer baştaki ve sondaki boşluklardan arındırılır; boşlar atlanır.
  */
-export function isB2Configured(): boolean {
-  return (
-    !!(
-      process.env["B2_KEY_ID"] &&
-      process.env["B2_APP_KEY"] &&
-      process.env["B2_ENDPOINT"]
-    ) && listConfiguredB2Buckets().length > 0
+function parseCommaList(raw: string | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Bucket konfigürasyonunu ayrıştırır.
+ * Virgül → hesap sınırı; pipe → aynı hesap içinde birden fazla bucket.
+ *
+ * Örnek: "bucket1|bucket2,bucket3,bucket4|bucket5"
+ *   → [ ["bucket1","bucket2"], ["bucket3"], ["bucket4","bucket5"] ]
+ */
+function parseBucketGroups(raw: string | undefined): string[][] {
+  if (!raw?.trim()) return [];
+  return raw.split(",").map((segment) =>
+    segment
+      .split("|")
+      .map((b) => b.trim())
+      .filter(Boolean),
   );
 }
 
 /**
- * Yükleme için bir B2 bucket seçer (round-robin).
- * @throws Hiç B2 bucket yapılandırılmamışsa hata fırlatır.
+ * Tüm yapılandırılmış B2 hesaplarını döner.
+ *
+ * Dizi uzunlukları eşleşmezse hata loglanır ve boş liste döner (fail-fast).
  */
-export function pickB2UploadBucket(): string {
-  const buckets = listConfiguredB2Buckets();
-  if (buckets.length === 0) {
-    throw new Error("B2 bucket tanımlı değil (B2_BUCKET_NAMES veya B2_BUCKET_NAME eksik)");
+export function listB2Accounts(): B2AccountConfig[] {
+  const keyIds = parseCommaList(process.env["B2_KEY_ID"]);
+  const appKeys = parseCommaList(process.env["B2_APP_KEY"]);
+  const endpoints = parseCommaList(process.env["B2_ENDPOINT"]);
+  const bucketGroups = parseBucketGroups(process.env["B2_BUCKET_NAMES"]);
+  const singleBucket = process.env["B2_BUCKET_NAME"]?.trim() ?? "";
+
+  // Hiç kimlik bilgisi yoksa yapılandırılmamış
+  if (keyIds.length === 0 && appKeys.length === 0 && endpoints.length === 0) {
+    return [];
   }
-  const bucket = buckets[_b2RoundRobinIndex % buckets.length]!;
-  _b2RoundRobinIndex = (_b2RoundRobinIndex + 1) % buckets.length;
-  return bucket;
+
+  // Temel kimlik bilgisi dizileri eşit uzunlukta olmalı
+  const credLengths = [keyIds.length, appKeys.length, endpoints.length];
+  const uniqueCredLengths = new Set(credLengths.filter((n) => n > 0));
+  if (uniqueCredLengths.size > 1) {
+    logger.error(
+      {
+        B2_KEY_ID: keyIds.length,
+        B2_APP_KEY: appKeys.length,
+        B2_ENDPOINT: endpoints.length,
+      },
+      "B2 konfigürasyon hatası: B2_KEY_ID, B2_APP_KEY ve B2_ENDPOINT " +
+        "virgülle ayrılmış değer sayıları eşit olmalıdır. " +
+        "B2 tamamen devre dışı bırakılıyor.",
+    );
+    return [];
+  }
+
+  const accountCount = [...uniqueCredLengths][0] ?? 0;
+  if (accountCount === 0) return [];
+
+  // Bucket grubu tanımlanmışsa hesap sayısıyla eşleşmeli
+  if (bucketGroups.length > 0 && bucketGroups.length !== accountCount) {
+    logger.error(
+      { accounts: accountCount, bucketGroups: bucketGroups.length },
+      "B2 konfigürasyon hatası: B2_BUCKET_NAMES virgülle ayrılmış segment sayısı " +
+        "hesap sayısıyla eşleşmiyor. B2 tamamen devre dışı bırakılıyor.",
+    );
+    return [];
+  }
+
+  const accounts: B2AccountConfig[] = [];
+
+  for (let i = 0; i < accountCount; i++) {
+    const keyId = keyIds[i];
+    const appKey = appKeys[i];
+    const endpoint = endpoints[i];
+    if (!keyId || !appKey || !endpoint) continue;
+
+    const buckets =
+      bucketGroups.length > 0
+        ? (bucketGroups[i] ?? [])
+        : singleBucket
+          ? [singleBucket]
+          : [];
+
+    if (buckets.length === 0) {
+      logger.warn(
+        { accountIndex: i + 1 },
+        `B2 hesabı #${i + 1}: bucket tanımlanmamış, atlanıyor.`,
+      );
+      continue;
+    }
+
+    accounts.push({ accountIndex: i + 1, keyId, appKey, endpoint, buckets });
+  }
+
+  return accounts;
 }
 
-// ── B2 İstemcisi ──────────────────────────────────────────────────────────────
-
-function getB2Client(): S3Client {
-  return new S3Client({
-    region: "auto",
-    endpoint: process.env["B2_ENDPOINT"]!,
-    credentials: {
-      accessKeyId: process.env["B2_KEY_ID"]!,
-      secretAccessKey: process.env["B2_APP_KEY"]!,
-    },
-  });
+/** B2'nin yapılandırılmış olup olmadığını kontrol eder. */
+export function isB2Configured(): boolean {
+  return listB2Accounts().length > 0;
 }
+
+/** Yapılandırılmış tüm B2 bucket adlarını döner (tüm hesaplar dahil). */
+export function listConfiguredB2Buckets(): string[] {
+  return listB2Accounts().flatMap((a) => a.buckets);
+}
+
+// ── S3 İstemci Önbelleği ──────────────────────────────────────────────────────
+
+const _b2ClientCache = new Map<string, S3Client>();
+
+/**
+ * B2AccountConfig için önbelleklenmiş S3Client döner.
+ * Aynı endpoint+keyId kombinasyonu için tek istemci yeniden kullanılır.
+ */
+export function getB2ClientForAccount(config: B2AccountConfig): S3Client {
+  const cacheKey = `${config.endpoint}::${config.keyId}`;
+  if (!_b2ClientCache.has(cacheKey)) {
+    _b2ClientCache.set(
+      cacheKey,
+      new S3Client({
+        region: "auto",
+        endpoint: config.endpoint,
+        credentials: {
+          accessKeyId: config.keyId,
+          secretAccessKey: config.appKey,
+        },
+      }),
+    );
+  }
+  return _b2ClientCache.get(cacheKey)!;
+}
+
+/**
+ * Birincil (ilk) hesap için S3Client döner.
+ * @throws Hiç B2 hesabı yapılandırılmamışsa hata fırlatır.
+ */
+function getDefaultB2Client(): S3Client {
+  const accounts = listB2Accounts();
+  if (accounts.length === 0) {
+    throw new Error(
+      "B2 yapılandırılmamış " +
+        "(B2_KEY_ID / B2_APP_KEY / B2_ENDPOINT / B2_BUCKET_NAMES eksik)",
+    );
+  }
+  return getB2ClientForAccount(accounts[0]!);
+}
+
+// ── Yol Yardımcısı ───────────────────────────────────────────────────────────
 
 /** B2 nesne yolu: files/{sha256(fileId)}/chunk_{i}.enc */
 function b2Key(fileId: string, chunkIndex: number): string {
@@ -94,9 +223,9 @@ function b2Key(fileId: string, chunkIndex: number): string {
 
 /**
  * Bir chunk'ı şifreleyerek belirtilen B2 bucket'ına yükler.
- * Şifreleme r2Storage.ts'deki encryptChunk ile aynı (AES-256-GCM).
  *
- * @param bucket  Hedef bucket adı (pickB2UploadBucket() sonucu)
+ * @param bucket  Hedef bucket adı
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
 export async function uploadChunkToB2(
   fileId: string,
@@ -104,11 +233,12 @@ export async function uploadChunkToB2(
   plaintext: Buffer,
   encryptionKey: Buffer,
   bucket: string,
+  client?: S3Client,
 ): Promise<void> {
-  const client = getB2Client();
+  const s3 = client ?? getDefaultB2Client();
   const encrypted = encryptChunk(plaintext, encryptionKey);
 
-  await client.send(
+  await s3.send(
     new PutObjectCommand({
       Bucket: bucket,
       Key: b2Key(fileId, chunkIndex),
@@ -127,18 +257,20 @@ export async function uploadChunkToB2(
  * Belirtilen B2 bucket'ından bir chunk'ı indirir ve şifresini çözer.
  *
  * @param bucket  Dosyanın saklandığı bucket (Firebase kaydından okunur)
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
 export async function downloadChunkFromB2(
   fileId: string,
   chunkIndex: number,
   encryptionKey: Buffer,
   bucket: string,
+  client?: S3Client,
 ): Promise<Buffer> {
-  const client = getB2Client();
+  const s3 = client ?? getDefaultB2Client();
 
   let response: GetObjectCommandOutput;
   try {
-    response = await client.send(
+    response = await s3.send(
       new GetObjectCommand({
         Bucket: bucket,
         Key: b2Key(fileId, chunkIndex),
@@ -166,28 +298,43 @@ export async function downloadChunkFromB2(
   for await (const piece of response.Body as AsyncIterable<Uint8Array>) {
     chunks.push(Buffer.from(piece));
   }
-  const encrypted = Buffer.concat(chunks);
-
-  return decryptChunk(encrypted, encryptionKey);
+  return decryptChunk(Buffer.concat(chunks), encryptionKey);
 }
 
 /**
  * B2 bucket bağlantısını test eder: küçük bir nesne yükler ve siler.
- * @returns latencyMs ve hata varsa error string
+ *
+ * @param bucket  Test edilecek bucket adı
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
-export async function testB2Connectivity(bucket: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
-  const client = getB2Client();
+export async function testB2Connectivity(
+  bucket: string,
+  client?: S3Client,
+): Promise<{ success: boolean; latencyMs: number; error?: string }> {
+  let s3: S3Client;
+  try {
+    s3 = client ?? getDefaultB2Client();
+  } catch (err: unknown) {
+    return {
+      success: false,
+      latencyMs: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
   const start = Date.now();
   const testBody = Buffer.from(`filesplit-connectivity-test-${Date.now()}`);
   try {
-    await client.send(new PutObjectCommand({
-      Bucket: bucket,
-      Key: B2_TEST_KEY,
-      Body: testBody,
-      ContentType: "application/octet-stream",
-      ContentLength: testBody.length,
-    }));
-    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: B2_TEST_KEY }));
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: B2_TEST_KEY,
+        Body: testBody,
+        ContentType: "application/octet-stream",
+        ContentLength: testBody.length,
+      }),
+    );
+    await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: B2_TEST_KEY }));
     return { success: true, latencyMs: Date.now() - start };
   } catch (err: unknown) {
     return {
@@ -203,23 +350,25 @@ export async function testB2Connectivity(bucket: string): Promise<{ success: boo
  * Eksik nesneler görmezden gelinir; asla hata fırlatmaz.
  *
  * @param bucket  Dosyanın saklandığı bucket (Firebase kaydından okunur)
+ * @param client  Kullanılacak S3Client; verilmezse birincil hesap kullanılır
  */
 export async function deleteFileChunksFromB2(
   fileId: string,
   chunkCount: number,
   bucket: string,
+  client?: S3Client,
 ): Promise<void> {
   if (!isB2Configured()) return;
-  const client = getB2Client();
+  let s3: S3Client;
+  try {
+    s3 = client ?? getDefaultB2Client();
+  } catch {
+    return;
+  }
 
   const deletions = Array.from({ length: chunkCount }, (_, i) =>
-    client
-      .send(
-        new DeleteObjectCommand({
-          Bucket: bucket,
-          Key: b2Key(fileId, i),
-        }),
-      )
+    s3
+      .send(new DeleteObjectCommand({ Bucket: bucket, Key: b2Key(fileId, i) }))
       .catch((err: unknown) => {
         logger.warn(
           { err, fileId, chunkIndex: i, bucket },
