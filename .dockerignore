@@ -20,6 +20,13 @@ Thumbs.db
 # Dependency caches (reinstalled inside image)
 node_modules
 
+# Replit / platform-specific npm config — must NOT leak into the image
+# because it points to package-firewall.replit.local which is unreachable
+# outside Replit's network.
+.npmrc
+.yarnrc
+.yarnrc.yml
+
 # Test & coverage
 coverage
 *.test.ts
