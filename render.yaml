@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: filesplit
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node dist/server/index.js
+    healthCheckPath: /api/healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: PORT
+        value: "10000"
+      - key: ALLOWED_ORIGINS
+        value: "https://filesplithosting.onrender.com"
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: FIREBASE_DATABASE_URL
+        sync: false
+      # ── Cloudflare R2 Depolama ────────────────────────────────────────────
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAMES
+        sync: false
+      # ── Upload limits (optional — defaults shown) ──────────────────────────
+      # Non-numeric values silently fall back to the defaults listed below.
+      - key: MAX_FILE_SIZE_MB
+        value: "500"
+      - key: CHUNK_SIZE_MB
+        value: "1"
+      - key: MAX_USER_STORAGE_MB
+        value: "5000"
+      - key: LOG_LEVEL
+        value: "info"
+    disk:
+      name: uploads
+      mountPath: /uploads
+      sizeGB: 1

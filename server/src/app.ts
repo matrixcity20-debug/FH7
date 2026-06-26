@@ -1,0 +1,102 @@
+import express, { type Express } from "express";
+import cors from "cors";
+import { sessionMiddleware } from "./lib/sessionMiddleware.js";
+import helmet from "helmet";
+import pinoHttp from "pino-http";
+import path from "path";
+import router from "./routes/index.js";
+import { logger } from "./lib/logger.js";
+
+
+declare module "express-session" {
+  interface SessionData {
+    userId?: string;
+    unlockedFiles?: string[];
+  }
+}
+
+const app: Express = express();
+
+app.set("trust proxy", 1);
+
+app.use(
+  helmet({
+    // BUL-06: enable CSP (supports React, WebSocket)
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        // Google Fonts CSS (googleapis.com) and actual font files (gstatic.com) must be
+        // explicitly allowed; Helmet's default blocks all external style/font sources.
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        mediaSrc: ["'self'", "blob:"],
+        connectSrc: ["'self'", "wss:", "ws:", "https:"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'self'"],
+        frameSrc: ["'none'"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+  }),
+);
+
+// BUL-05: fail-fast in production if ALLOWED_ORIGINS is not configured
+if (process.env["NODE_ENV"] === "production" && !process.env["ALLOWED_ORIGINS"]) {
+  throw new Error("ALLOWED_ORIGINS environment variable is required in production");
+}
+// SEC: even in dev, never open CORS to all origins — enumerate localhost ports
+const allowedOrigins: string[] = process.env["ALLOWED_ORIGINS"]
+  ? process.env["ALLOWED_ORIGINS"].split(",").map((o) => o.trim())
+  : [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://127.0.0.1:3000",
+      "http://127.0.0.1:5173",
+    ];
+
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  }),
+);
+
+app.use(
+  pinoHttp({
+    logger,
+    serializers: {
+      req(req) {
+        return {
+          id: req.id,
+          method: req.method,
+          url: req.url?.split("?")[0],
+        };
+      },
+      res(res) {
+        return {
+          statusCode: res.statusCode,
+        };
+      },
+    },
+  }),
+);
+
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+// BUL-02: shared session middleware (also used by WebSocket signaling server)
+app.use(sessionMiddleware);
+
+app.use("/api", router);
+
+if (process.env["NODE_ENV"] === "production") {
+  const publicDir = path.resolve(process.cwd(), "dist/public");
+  app.use(express.static(publicDir));
+  app.get("/*splat", (_req, res) => {
+    res.sendFile(path.join(publicDir, "index.html"));
+  });
+}
+
+export default app;
