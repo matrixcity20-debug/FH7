@@ -39,7 +39,19 @@ const FB_ROOT = "filesplit_files";
 export interface R2FileInfo {
   provider?: "r2" | "b2" | "e2";
   bucket: string;
-  encryptionKeyHex: string;
+  /**
+   * Legacy: plaintext AES-256 key stored in Firebase.
+   * Set for files uploaded before the ECDH key exchange was introduced.
+   * New files use epkHex instead — the AES key is derived on demand via ECDH+HKDF.
+   */
+  encryptionKeyHex?: string;
+  /**
+   * Client ephemeral X25519 public key (64 hex chars = 32 bytes).
+   * Set for files uploaded with the ECDH key exchange layer.
+   * The server derives the AES-256 key on demand: ECDH(server_priv, epk) → HKDF → AES key.
+   * This key is NEVER stored — only the ephemeral public key is.
+   */
+  epkHex?: string;
   chunkCount: number;
   uploadedAt: string;
 }
@@ -215,7 +227,7 @@ export async function getReadyFileRecord(fileId: string): Promise<FileRecord | n
   if (!record) return null;
   const status = record.cloudUpload?.status ?? "ready";
   if (status !== "ready") return null;
-  if (!record.r2?.encryptionKeyHex) return null;
+  if (!record.r2?.encryptionKeyHex && !record.r2?.epkHex) return null;
   return record;
 }
 

@@ -10,6 +10,7 @@ import { toast } from "@/hooks/use-toast";
 
 import { hashFileStreaming } from "@/lib/sha256";
 import { fetchWithRetry, FetchAbortedError } from "@/lib/fetchWithRetry";
+import * as clientCrypto from "@/lib/clientCrypto";
 
 const DEFAULT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024; // 500 MB fallback
 
@@ -277,7 +278,21 @@ export default function UploadPage() {
       if (abortRef.current) return;
       setUploadStep({ phase: "finalizing" });
 
-      // ── Aşama 4: Finalize ──────────────────────────────────────────────────────
+      // ── Aşama 4: Kriptografik imza + ECDH anahtar değişimi ────────────────────
+      // Generate a fresh ephemeral X25519 key pair for this upload.
+      // The server will do ECDH(server_static_priv, client_ephemeral_pub) + HKDF
+      // to derive the AES-256 encryption key — the key is NEVER stored.
+      let epkHex: string | undefined;
+      let ed25519Signature: string | undefined;
+      try {
+        epkHex = await clientCrypto.generateEphemeralECDHPublicKey();
+        // Sign the SHA-256 hash with Ed25519 private key (proves file ownership)
+        ed25519Signature = await clientCrypto.signFileHash(sha256) ?? undefined;
+      } catch {
+        // Crypto not supported or no cached key — upload proceeds without crypto layer
+      }
+
+      // ── Aşama 5: Finalize ──────────────────────────────────────────────────────
       const finalRes = await fetchWithRetry(
         "/api/files/upload-finalize",
         {
@@ -292,6 +307,8 @@ export default function UploadPage() {
             mimeType: file.type || "application/octet-stream",
             totalParts,
             sha256,
+            ...(epkHex ? { epkHex } : {}),
+            ...(ed25519Signature ? { ed25519Signature } : {}),
             ...(ttl ? { ttl } : {}),
             ...(parentFileId ? { parentFileId } : {}),
             ...(selectedFolderId ? { folderId: selectedFolderId } : {}),

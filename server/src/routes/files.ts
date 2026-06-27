@@ -59,6 +59,8 @@ import {
   findStorageTargetByBucket,
   type StorageTarget,
 } from "../lib/storageProvider.js";
+import { deriveFileEncryptionKey } from "../lib/ecdhProvider.js";
+import { verifyEd25519Signature } from "../lib/keyStore.js";
 import {
   createPendingFileRecord,
   markFileRecordReady,
@@ -294,10 +296,15 @@ const UPLOAD_RETRY_BASE_MS = 2_000;
 async function uploadFileChunksToStorage(
   meta: FileMeta,
   log: Request["log"],
+  epkHex?: string,
 ): Promise<void> {
   if (!isAnyStorageConfigured()) return;
 
-  const encryptionKey = generateEncryptionKey();
+  // Derive AES key via ECDH+HKDF if the client provided an ephemeral public key;
+  // otherwise fall back to a random key (legacy uploads / no crypto layer).
+  const encryptionKey = epkHex
+    ? deriveFileEncryptionKey(epkHex, meta.id)
+    : generateEncryptionKey();
   const target: StorageTarget = await pickUploadTarget();
   const CONCURRENCY = 6;
 
@@ -331,7 +338,12 @@ async function uploadFileChunksToStorage(
       const r2Info: R2FileInfo = {
         provider: target.provider,
         bucket: target.bucket,
-        encryptionKeyHex: encryptionKey.toString("hex"),
+        // ECDH mode: store only the ephemeral public key (AES key derivable on demand)
+        // Legacy mode: store the raw AES key (pre-ECDH uploads)
+        ...(epkHex
+          ? { epkHex }
+          : { encryptionKeyHex: encryptionKey.toString("hex") }
+        ),
         chunkCount: meta.chunkCount,
         uploadedAt: new Date().toISOString(),
       };
@@ -380,11 +392,20 @@ async function tryRestoreChunkFromStorage(
 
   try {
     const record = await getReadyFileRecord(fileId);
-    if (!record?.r2?.encryptionKeyHex) return false;
+    if (!record?.r2) return false;
 
-    const encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
-    if (encryptionKey.length !== 32) {
-      log.warn({ fileId, chunkIndex }, "Invalid encryption key length in Firebase record");
+    // Resolve AES key: ECDH-derived (new) or stored (legacy)
+    let encryptionKey: Buffer;
+    if (record.r2.epkHex) {
+      encryptionKey = deriveFileEncryptionKey(record.r2.epkHex, fileId);
+    } else if (record.r2.encryptionKeyHex) {
+      encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
+      if (encryptionKey.length !== 32) {
+        log.warn({ fileId, chunkIndex }, "Invalid legacy encryption key length in Firebase record");
+        return false;
+      }
+    } else {
+      log.warn({ fileId, chunkIndex }, "No encryption key found in Firebase record");
       return false;
     }
 
@@ -432,11 +453,20 @@ async function ensureAllChunksLocal(
 
   // Firebase kaydını bir kere çek — sadece "ready" kayıtlar kullanılır
   const record = await getReadyFileRecord(meta.id);
-  if (!record?.r2?.encryptionKeyHex || !record.r2.bucket) return false;
+  if (!record?.r2?.bucket) return false;
 
-  const encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
-  if (encryptionKey.length !== 32) {
-    log.warn({ fileId: meta.id }, "Invalid encryption key length in Firebase record");
+  // Resolve AES key: ECDH-derived (new) or stored (legacy)
+  let encryptionKey: Buffer;
+  if (record.r2.epkHex) {
+    encryptionKey = deriveFileEncryptionKey(record.r2.epkHex, meta.id);
+  } else if (record.r2.encryptionKeyHex) {
+    encryptionKey = Buffer.from(record.r2.encryptionKeyHex, "hex");
+    if (encryptionKey.length !== 32) {
+      log.warn({ fileId: meta.id }, "Invalid legacy encryption key length in Firebase record");
+      return false;
+    }
+  } else {
+    log.warn({ fileId: meta.id }, "No encryption key found in Firebase record");
     return false;
   }
 
@@ -824,7 +854,10 @@ router.post(
 );
 
 router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, res): Promise<void> => {
-  const { uploadId, name, size, mimeType, totalParts, sha256, ttl, parentFileId, folderId } = req.body as {
+  const {
+    uploadId, name, size, mimeType, totalParts, sha256, ttl, parentFileId, folderId,
+    epkHex, ed25519Signature,
+  } = req.body as {
     uploadId: string;
     name: string;
     size: number;
@@ -834,6 +867,10 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     ttl?: string;
     parentFileId?: string;
     folderId?: string;
+    /** Client ephemeral X25519 public key for ECDH encryption key derivation */
+    epkHex?: string;
+    /** Ed25519 signature of the SHA-256 file hash — proves file ownership */
+    ed25519Signature?: string;
   };
 
   if (!uploadId || !isValidUploadId(uploadId) || !name || !size || !mimeType || !totalParts || !sha256) {
@@ -927,6 +964,40 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
     // BUL-16: verify folder belongs to current user in upload-finalize
     const resolvedFolderId = _finalizeFolderMeta?.userId === req.session.userId ? folderId : undefined;
 
+    // ── Validate ephemeral public key format (if provided) ───────────────────
+    const resolvedEpkHex =
+      typeof epkHex === "string" && /^[0-9a-f]{64}$/i.test(epkHex)
+        ? epkHex.toLowerCase()
+        : undefined;
+
+    // ── Verify Ed25519 file ownership signature (if provided) ─────────────────
+    // Signature = Ed25519_sign(SHA-256_hash_bytes, uploader_private_key)
+    // We verify it with the uploader's registered public key.
+    // If user has a registered key but the signature is invalid → reject upload.
+    // If user has a registered key and no signature provided → allow (backward compat).
+    // If user has no registered key → skip verification.
+    let resolvedEd25519Sig: string | undefined;
+    if (
+      typeof ed25519Signature === "string" &&
+      /^[0-9a-f]{128}$/i.test(ed25519Signature) &&
+      req.session.userId
+    ) {
+      const hashBytes = Buffer.from(serverHash, "hex");
+      const sigValid = await verifyEd25519Signature(
+        req.session.userId,
+        hashBytes,
+        ed25519Signature,
+      );
+      if (!sigValid) {
+        deleteFile(fileId);
+        req.log.warn({ uploadId, fileId, userId: req.session.userId }, "Ed25519 file signature verification failed");
+        res.status(403).json({ error: "Dosya sahiplik imzası doğrulanamadı. Lütfen tekrar oturum açın." });
+        return;
+      }
+      resolvedEd25519Sig = ed25519Signature.toLowerCase();
+      req.log.info({ fileId, userId: req.session.userId }, "Ed25519 file ownership verified");
+    }
+
     const chunkUrls = buildChunkUrls(fileId, chunkCount, baseUrl);
     const meta: FileMeta = {
       id: fileId,
@@ -942,19 +1013,24 @@ router.post("/files/upload-finalize", requireAuth, uploadLimiter, async (req, re
       ...(expiresAt ? { expiresAt } : {}),
       ...(groupId ? { groupId, version } : {}),
       ...(resolvedFolderId ? { folderId: resolvedFolderId } : {}),
+      ...(resolvedEd25519Sig ? { ed25519Signature: resolvedEd25519Sig } : {}),
+      ...(resolvedEpkHex ? { epkHex: resolvedEpkHex } : {}),
     };
 
     saveMeta(meta);
     // Önce Firebase'e "pending" kaydı yaz — cloud upload başarısız olsa bile
     // dosya kaydı asla kaybolmaz. Ardından arka planda yüklemeyi başlat.
     void createPendingFileRecord(meta).then(() => {
-      void uploadFileChunksToStorage(meta, req.log).catch((err: unknown) => {
+      void uploadFileChunksToStorage(meta, req.log, resolvedEpkHex).catch((err: unknown) => {
         req.log.error({ err, fileId: meta.id }, "Background storage upload failed (finalize)");
       });
     });
     // SEC-IDOR: release the uploadId → sessionID binding now that finalize is done
     deleteSession(uploadId);
-    req.log.info({ fileId, name, chunkCount }, "Chunked upload finalised");
+    req.log.info(
+      { fileId, name, chunkCount, hasECDH: !!resolvedEpkHex, hasSignature: !!resolvedEd25519Sig },
+      "Chunked upload finalised",
+    );
     res.status(201).json(meta);
   } catch (err) {
     deleteSession(uploadId);

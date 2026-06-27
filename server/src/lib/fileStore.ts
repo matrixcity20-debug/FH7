@@ -42,6 +42,17 @@ export interface FileMeta {
   folderId?: string;
   requireLogin?: boolean;
   passwordHash?: string;
+  /**
+   * Ed25519 signature of the file's SHA-256 hash, produced by the uploader's private key.
+   * Hex-encoded, 128 chars (64 bytes). Immutable proof of file ownership.
+   * Verifiable with the uploader's registered Ed25519 public key.
+   */
+  ed25519Signature?: string;
+  /**
+   * Client ephemeral X25519 public key used for ECDH file encryption key derivation.
+   * Stored so the server can re-derive the AES key for downloads.
+   */
+  epkHex?: string;
 }
 
 export interface FolderMeta {
