@@ -140,3 +140,10 @@ export function generateServerECDHKeyJWK(): string {
   const jwk = privateKey.export({ format: "jwk" });
   return Buffer.from(JSON.stringify(jwk), "utf-8").toString("base64");
 }
+
+// ── Eager initialisation ──────────────────────────────────────────────────────
+// Force the key pair to load at module import time (i.e. server startup) rather
+// than lazily on the first request.  This guarantees the startup log always
+// contains either the "loaded from environment" message or the ephemeral-key
+// warning + SERVER_ECDH_PRIVATE_JWK value that the operator must persist.
+loadServerKeyPair();
