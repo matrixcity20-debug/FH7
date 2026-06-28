@@ -25,17 +25,20 @@ import { getStorageSummary } from "../lib/storageProvider.js";
 import { type FileRecord } from "../lib/fileRegistry.js";
 import {
   isR2Configured,
-  listConfiguredBuckets as listR2Buckets,
+  listR2Accounts,
+  getR2ClientForAccount,
   testR2Connectivity,
 } from "../lib/r2Storage.js";
 import {
   isB2Configured,
-  listConfiguredB2Buckets,
+  listB2Accounts,
+  getB2ClientForAccount,
   testB2Connectivity,
 } from "../lib/b2Storage.js";
 import {
   isE2Configured,
-  listConfiguredE2Buckets,
+  listE2Accounts,
+  getE2ClientForAccount,
   testE2Connectivity,
 } from "../lib/e2Storage.js";
 import { storageHealthMonitor } from "../lib/storageHealthMonitor.js";
@@ -408,30 +411,39 @@ router.post("/admin/storage/test", requireAdmin, adminLimiter, async (req, res):
 
   const tasks: Array<Promise<BucketTestResult>> = [];
 
-  // R2 testleri
+  // R2 testleri — her hesap için doğru client kullanılır
   if ((targetProvider === "r2" || targetProvider === "all") && isR2Configured()) {
-    for (const bucket of listR2Buckets()) {
-      tasks.push(
-        testR2Connectivity(bucket).then((r) => ({ provider: "r2" as const, bucket, ...r })),
-      );
+    for (const account of listR2Accounts()) {
+      const client = getR2ClientForAccount(account);
+      for (const bucket of account.buckets) {
+        tasks.push(
+          testR2Connectivity(bucket, client).then((r) => ({ provider: "r2" as const, bucket, ...r })),
+        );
+      }
     }
   }
 
-  // B2 testleri
+  // B2 testleri — her hesap için doğru client kullanılır
   if ((targetProvider === "b2" || targetProvider === "all") && isB2Configured()) {
-    for (const bucket of listConfiguredB2Buckets()) {
-      tasks.push(
-        testB2Connectivity(bucket).then((r) => ({ provider: "b2" as const, bucket, ...r })),
-      );
+    for (const account of listB2Accounts()) {
+      const client = getB2ClientForAccount(account);
+      for (const bucket of account.buckets) {
+        tasks.push(
+          testB2Connectivity(bucket, client).then((r) => ({ provider: "b2" as const, bucket, ...r })),
+        );
+      }
     }
   }
 
-  // e2 testleri
+  // e2 testleri — her hesap için doğru client kullanılır
   if ((targetProvider === "e2" || targetProvider === "all") && isE2Configured()) {
-    for (const bucket of listConfiguredE2Buckets()) {
-      tasks.push(
-        testE2Connectivity(bucket).then((r) => ({ provider: "e2" as const, bucket, ...r })),
-      );
+    for (const account of listE2Accounts()) {
+      const client = getE2ClientForAccount(account);
+      for (const bucket of account.buckets) {
+        tasks.push(
+          testE2Connectivity(bucket, client).then((r) => ({ provider: "e2" as const, bucket, ...r })),
+        );
+      }
     }
   }
 
